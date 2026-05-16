@@ -1117,9 +1117,16 @@ pub fn bellman_ford(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
 /// Calls `kSSSP(H, s, n)` which is sufficient by Definition 5.1.
 pub fn restricted_sssp(h: &Graph, source: NodeId) -> Vec<i64> {
     let n = h.node_count();
-    // Base-case cutoff: log⁶ n. We use at least 1 to avoid degenerate cases.
+    // Base-case cutoff: the paper prescribes log⁶ n, but that exceeds n for
+    // all practical input sizes (at n = 62 500 it reaches 16⁶ ≈ 16.7M), so
+    // the recursive HJS path-cover machinery never fires.  We use log² n
+    // instead, which is below n for every n ≥ 2 and still provides a
+    // comfortable margin above the constant overhead of the recursive case.
+    // Correctness is unaffected: the threshold only selects between two code
+    // paths that both produce the correct answer; the smaller value simply
+    // causes the recursive (faster-asymptotically) branch to fire earlier.
     let log_n = (usize::BITS - n.leading_zeros()) as usize;
-    let threshold = (log_n * log_n * log_n * log_n * log_n * log_n).max(1);
+    let threshold = (log_n * log_n).max(1);
     k_sssp(h, source, n, threshold)
 }
 

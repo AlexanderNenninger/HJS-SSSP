@@ -222,15 +222,18 @@ fn bench_large(c: &mut Criterion) {
     for &n in &[25000usize, 62500] {
         let (g, src) = make_dense_complex_graph(n, 100, 42);
 
-        group.bench_with_input(BenchmarkId::new("HJS", n), &(&g, src), |b, &(g, src)| {
-            b.iter(|| sssp(black_box(g), black_box(src)))
-        });
+        // HJS-forced (threshold=2) fires the full path-cover recursion at every
+        // level, exercising the machinery that distinguishes HJS from Goldberg.
+        group.bench_with_input(
+            BenchmarkId::new("HJS-forced", n),
+            &(&g, src),
+            |b, &(g, src)| b.iter(|| sssp_hjs_forced(black_box(g), black_box(src), 2)),
+        );
         group.bench_with_input(
             BenchmarkId::new("Goldberg", n),
             &(&g, src),
             |b, &(g, src)| b.iter(|| goldberg(black_box(g), black_box(src))),
         );
-        // Omit BellmanFord and HJS-forced from large benchmarks—they're much slower.
     }
     group.finish();
 }

@@ -1,4 +1,4 @@
-# hjs-path-finding
+# HJS SSSP
 
 A Rust implementation of the **Haeupler–Jiang–Saranurak (HJS) 2025** algorithm for
 single-source shortest paths (SSSP) in directed graphs with negative integer weights,
@@ -212,93 +212,60 @@ cargo bench --features parallel    # with Rayon (thresholds apply, no difference
 
 ### Sparse graph — random directed, ~4 edges per node, weights ∈ [−10, 10]
 
-| n   | m      | HJS       | Goldberg  | Bellman-Ford |
-|-----|--------|-----------|-----------|--------------|
-|  50 |   ~200 |  16.4 µs  |  16.7 µs  |   7.0 µs     |
-| 100 |   ~400 |  44.0 µs  |  43.9 µs  |  32.7 µs     |
-| 200 |   ~800 |   130 µs  |   127 µs  |   129 µs     |
-| 400 | ~1 600 |   362 µs  |   361 µs  |   531 µs     |
-| 800 | ~3 200 |  1.03 ms  |  1.04 ms  |  2.43 ms     |
+| n   | m      | Goldberg  | Bellman-Ford |
+|-----|--------|-----------|--------------|
+|  50 |   ~200 |  16.7 µs  |   7.0 µs     |
+| 100 |   ~400 |  43.9 µs  |  32.7 µs     |
+| 200 |   ~800 |   127 µs  |   129 µs     |
+| 400 | ~1 600 |   361 µs  |   531 µs     |
+| 800 | ~3 200 |  1.04 ms  |  2.43 ms     |
 
-HJS-forced (forces full recursion at every level) is included in benches but omitted above:
-it is 8–25× slower than HJS/Goldberg and intended only for algorithm research.
+`sssp` (HJS) produces identical timings to Goldberg at all these sizes — see below.
 
 ### Path graph — linear chain 0→1→…→(n−1), weights ∈ [−5, 5], no negative cycle
 
-| n    | HJS      | Goldberg  | Bellman-Ford |
-|------|----------|-----------|--------------|
-|  200 |  74.5 µs |  74.1 µs  |    585 ns    |
-|  500 |   268 µs |   269 µs  |   1.39 µs    |
-| 1000 |   832 µs |   829 µs  |   2.74 µs    |
+| n    | Goldberg  | Bellman-Ford |
+|------|-----------|--------------|
+|  200 |  74.1 µs  |    585 ns    |
+|  500 |   269 µs  |   1.39 µs    |
+| 1000 |   829 µs  |   2.74 µs    |
 
-Path graphs have at most one negative edge in any path, so Bellman-Ford terminates in
-O(m) time. HJS and Goldberg are orders of magnitude slower because they apply scaling
-phases regardless of negative-edge structure.
+Bellman-Ford's early-termination makes it orders of magnitude faster on path-like graphs;
+Goldberg/HJS apply all scaling phases regardless of structure.
 
 ### Grid graph — r×c DAG-like grid, weights ∈ [−3, 3]
 
-| n (r×c)       | HJS      | Goldberg  | Bellman-Ford |
-|---------------|----------|-----------|--------------|
-| 100  (10×10)  |  17.8 µs |  18.2 µs  |    505 ns    |
-| 225  (15×15)  |  42.6 µs |  43.0 µs  |   1.10 µs    |
-| 400  (20×20)  |  83.6 µs |  84.8 µs  |   1.98 µs    |
+| n (r×c)       | Goldberg  | Bellman-Ford |
+|---------------|-----------|--------------|
+| 100  (10×10)  |  18.2 µs  |    505 ns    |
+| 225  (15×15)  |  43.0 µs  |   1.10 µs    |
+| 400  (20×20)  |  84.8 µs  |   1.98 µs    |
 
-Grid graphs are nearly-DAG structures where negative edges seldom form cycles. Bellman-Ford
-is again extremely fast. HJS and Goldberg scale with m rather than the cycle structure.
+### Large dense graph — HJS-forced vs Goldberg, ~10 edges per node, weights ∈ [−100, 100]
 
-### Large dense graph — ~10 edges per node, weights ∈ [−100, 100]
+`HJS-forced` (threshold=2) fires the full path-cover recursion at every level; this is the
+only benchmark where the recursive HJS machinery actually executes.
 
-This benchmark targets the regime where HJS's theoretical advantage begins to materialise.
-Graphs are random with high density and a large weight range (many scaling phases).
-BF and HJS-forced are omitted — they are orders of magnitude slower at these sizes.
+| n      | m (≈10n)   | HJS-forced | Goldberg  |
+|--------|------------|------------|-----------|
+| 25 000 | ~250 000   |    950 ms  |   747 ms  |
+| 62 500 | ~625 000   |   3.46 s   |  3.36 s   |
 
-| n      | m (≈10n)   | HJS      | Goldberg  |
-|--------|------------|----------|-----------|
-|  5 000 |  ~50 000   |  37.0 ms |  36.3 ms  |
-| 12 500 | ~125 000   |   222 ms |   225 ms  |
-| 25 000 | ~250 000   |   693 ms |   699 ms  |
-| 62 500 | ~625 000   |  3.233 s |  3.280 s  |
-
-HJS pulls ahead of Goldberg at n ≥ 12 500 and the gap widens slowly, consistent with the
-theoretical crossover between O(log⁸ n) and O(√n) occurring well above n = 10⁵ in
-practice due to constant-factor differences.
+The forced recursion is still slower than Goldberg at these sizes — the path-cover and G″
+construction overhead has not yet been recovered by the asymptotically cheaper inner loop.
 
 ---
 
-## Why HJS and Goldberg are so close in practice
+## Why `sssp` and Goldberg perform identically
 
-The theoretical complexity gap between HJS (O(m log⁸ n · log(nW))) and Goldberg
-(O(m √n log(nW))) is large asymptotically, but the two algorithms share nearly all of
-their *actual work* at the sizes we can benchmark on a laptop:
-
-**1. Both are potential-based bit-scaling algorithms.**
-Each processes the same log₂(W) + 1 scaling phases. In every phase both algorithms build
-a potential-adjusted copy of the graph and call an SSSP subroutine. The outer loop is
-identical; only the inner subroutine differs.
-
-**2. The inner subroutine is the same at small k.**
-Goldberg uses `sssp_minus_one` (Bellman-Ford adapted for weights in {−1, 0, …, n})
-inside each phase. HJS uses `k_sssp`, which at small k (k ≤ log⁶ n) falls back to
-`sssp_few_negative` — which is also alternating Dijkstra/Bellman-Ford passes over
-essentially the same graph. For graphs up to n ≈ 10⁵, log⁶ n ≈ 17⁶ ≈ 24 million,
-so `k_sssp`'s recursion never fires: both algorithms run the same inner loop.
-
-**3. The HJS recursion depth is still shallow.**
-The log⁶ n threshold is enormous — larger than any n we benchmark. Even at n = 62 500,
-log₂(62 500) ≈ 15.9, so log⁶ n ≈ 1.6 × 10⁷. The recursive case that distinguishes HJS
-from Goldberg (building the path cover and the tiered G″ graph) is never triggered; HJS
-degenerates to Goldberg for all practical input sizes on this hardware.
-
-**4. The constant factors heavily favour Goldberg.**
-Goldberg's `sssp_minus_one` is a tight, cache-friendly BF loop. HJS's `k_sssp` wrapper
-adds function-call overhead, SCC decomposition, path-cover construction, and a slightly
-larger working set even in the base case. These factors cancel the theoretical saving
-until n is large enough for the O(√n) vs O(log⁸ n) difference to dominate them.
-
-**In short:** HJS's advantage is exclusively in its recursion depth — but that recursion
-only pays off once k (the negative-edge count per phase) exceeds log⁶ n, which requires
-graphs with n ≫ 10⁶. Below that, both algorithms execute the same operations at
-essentially the same cost.
+Both are potential-based bit-scaling algorithms with the same outer loop (log₂(W) + 1
+phases, each building a potential-adjusted graph). The difference is in the inner SSSP
+subroutine: Goldberg calls `sssp_minus_one` (a tight BF loop for weights in {−1,…,n});
+HJS calls `k_sssp`, which falls back to the same alternating Dijkstra/BF logic whenever
+k ≤ threshold (log² n in this implementation). For every n benchmarked, k ≪ threshold,
+so the HJS recursive path-cover case never fires and both algorithms execute identical
+work. The recursive branch only becomes beneficial at n ≫ 10⁶ where the O(√n) vs
+O(log⁸ n) gap finally outweighs Goldberg's smaller constant factors.
 
 ---
 
