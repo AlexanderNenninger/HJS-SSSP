@@ -2,7 +2,7 @@ name: Build wheels
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     tags:
       - "v*"           # v0.1.0, v1.2.3, …
   pull_request:
