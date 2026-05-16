@@ -6,11 +6,20 @@ license = "MIT OR Apache-2.0"
 description = "Haeupler–Jiang–Saranurak 2025 algorithm for single-source shortest paths with negative weights"
 repository = "https://github.com/AlexanderNenninger/hjs-sssp"
 
+[lib]
+name = "hjs_sssp"
+crate-type = ["rlib", "cdylib"]
+
 [features]
 parallel = ["dep:rayon"]
+python = ["dep:pyo3"]
 
 [dependencies]
 rayon = { version = "1", optional = true }
+# extension-module is intentionally NOT listed here: maturin injects it
+# automatically when building a cdylib Python extension.  Without it,
+# `cargo test --features python` can link against libpython normally.
+pyo3 = { version = "0.23", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

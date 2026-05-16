@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "hjs-sssp"
+version = "0.1.0"
+requires-python = ">=3.8"
+description = "HJS 2025 single-source shortest paths — Rust library with NetworkX interface"
+license = { text = "MIT OR Apache-2.0" }
+dependencies = ["networkx>=3.0"]
+
+[dependency-groups]
+dev = ["maturin>=1.0,<2.0", "networkx>=3.0"]
+
+[tool.maturin]
+# maturin automatically adds pyo3/extension-module for the cdylib build.
+features = ["python"]
+bindings = "pyo3"

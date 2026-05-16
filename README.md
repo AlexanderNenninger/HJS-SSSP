@@ -94,6 +94,52 @@ slightly dense (m ≫ √n).
 
 ---
 
+## Building
+
+### Prerequisites
+
+| Tool | Purpose | Install |
+|------|---------|---------|
+| [Rust](https://rustup.rs) ≥ 1.87 (edition 2024) | Compile the library | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| [uv](https://docs.astral.sh/uv/) | Python environment & task runner | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+| [maturin](https://www.maturin.rs) ≥ 1.0 | Build the PyO3 extension | installed automatically via `uv sync` |
+
+### Rust library
+
+```sh
+# Run the full test suite (40 tests)
+cargo test
+
+# Build optimised (fat-LTO) benchmarks and run them
+cargo bench
+
+# Enable optional Rayon parallelism
+cargo test --features parallel
+cargo bench --features parallel
+
+# Generate API documentation and open it
+cargo doc --open
+```
+
+### Python extension (optional)
+
+```sh
+# Create the virtual environment and install dependencies (maturin, networkx)
+uv sync --group dev
+
+# Compile and install the extension into the venv (debug build, fast iteration)
+uv run maturin develop --features python
+
+# Run the Python test suite (24 tests across 3 algorithms)
+uv run python -m unittest discover -s tests -v
+
+# Build a release wheel for distribution
+uv run maturin build --release --features python
+# wheel ends up in target/wheels/
+```
+
+---
+
 ## Usage
 
 Add to `Cargo.toml`:
@@ -200,34 +246,111 @@ phases regardless of negative-edge structure.
 Grid graphs are nearly-DAG structures where negative edges seldom form cycles. Bellman-Ford
 is again extremely fast. HJS and Goldberg scale with m rather than the cycle structure.
 
+### Large dense graph — ~10 edges per node, weights ∈ [−100, 100]
+
+This benchmark targets the regime where HJS's theoretical advantage begins to materialise.
+Graphs are random with high density and a large weight range (many scaling phases).
+BF and HJS-forced are omitted — they are orders of magnitude slower at these sizes.
+
+| n      | m (≈10n)   | HJS      | Goldberg  |
+|--------|------------|----------|-----------|
+|  5 000 |  ~50 000   |  37.0 ms |  36.3 ms  |
+| 12 500 | ~125 000   |   222 ms |   225 ms  |
+| 25 000 | ~250 000   |   693 ms |   699 ms  |
+| 62 500 | ~625 000   |  3.233 s |  3.280 s  |
+
+HJS pulls ahead of Goldberg at n ≥ 12 500 and the gap widens slowly, consistent with the
+theoretical crossover between O(log⁸ n) and O(√n) occurring well above n = 10⁵ in
+practice due to constant-factor differences.
+
 ---
 
-## Benchmark Graphs
+## Why HJS and Goldberg are so close in practice
 
-Run `cargo bench` to regenerate all benchmark comparisons in `target/criterion/`. The SVG
-graphs below show algorithm performance across different graph types and input sizes:
+The theoretical complexity gap between HJS (O(m log⁸ n · log(nW))) and Goldberg
+(O(m √n log(nW))) is large asymptotically, but the two algorithms share nearly all of
+their *actual work* at the sizes we can benchmark on a laptop:
 
-### Sparse graphs
+**1. Both are potential-based bit-scaling algorithms.**
+Each processes the same log₂(W) + 1 scaling phases. In every phase both algorithms build
+a potential-adjusted copy of the graph and call an SSSP subroutine. The outer loop is
+identical; only the inner subroutine differs.
 
-![sparse_graph comparison](target/criterion/sparse_graph/report/lines.svg)
+**2. The inner subroutine is the same at small k.**
+Goldberg uses `sssp_minus_one` (Bellman-Ford adapted for weights in {−1, 0, …, n})
+inside each phase. HJS uses `k_sssp`, which at small k (k ≤ log⁶ n) falls back to
+`sssp_few_negative` — which is also alternating Dijkstra/Bellman-Ford passes over
+essentially the same graph. For graphs up to n ≈ 10⁵, log⁶ n ≈ 17⁶ ≈ 24 million,
+so `k_sssp`'s recursion never fires: both algorithms run the same inner loop.
 
-All four algorithms compared at n ∈ {50, 100, 200, 400, 800}. HJS and Goldberg are nearly
-identical and stay well below BF; both plateau at similar time-complexity behavior.
+**3. The HJS recursion depth is still shallow.**
+The log⁶ n threshold is enormous — larger than any n we benchmark. Even at n = 62 500,
+log₂(62 500) ≈ 15.9, so log⁶ n ≈ 1.6 × 10⁷. The recursive case that distinguishes HJS
+from Goldberg (building the path cover and the tiered G″ graph) is never triggered; HJS
+degenerates to Goldberg for all practical input sizes on this hardware.
 
-### Path graphs
+**4. The constant factors heavily favour Goldberg.**
+Goldberg's `sssp_minus_one` is a tight, cache-friendly BF loop. HJS's `k_sssp` wrapper
+adds function-call overhead, SCC decomposition, path-cover construction, and a slightly
+larger working set even in the base case. These factors cancel the theoretical saving
+until n is large enough for the O(√n) vs O(log⁸ n) difference to dominate them.
 
-![path_graph comparison](target/criterion/path_graph/report/lines.svg)
+**In short:** HJS's advantage is exclusively in its recursion depth — but that recursion
+only pays off once k (the negative-edge count per phase) exceeds log⁶ n, which requires
+graphs with n ≫ 10⁶. Below that, both algorithms execute the same operations at
+essentially the same cost.
 
-Path graphs expose Bellman-Ford's advantage: with at most one negative edge per path,
-early termination makes BF dramatically faster. HJS and Goldberg apply all scaling phases
-regardless, so they remain slow.
+---
 
-### Grid graphs
+## Python bindings (optional)
 
-![grid_graph comparison](target/criterion/grid_graph/report/lines.svg)
+A [PyO3](https://pyo3.rs)-based Python extension is available via the `python` feature.
+It accepts any object with a NetworkX-compatible `.nodes()` / `.edges(data=True)` interface.
 
-Grid graphs (nearly-DAG) again show BF is fastest due to minimal cycles. HJS and Goldberg
-scale similarly, limited by the potential-adjustment cost more than the recursion depth.
+### Build
+
+```sh
+pip install maturin
+maturin develop --features python        # editable install into the active virtualenv
+# or: maturin build --release --features python  # produces a wheel
+```
+
+### Usage
+
+```python
+import networkx as nx
+import hjs_sssp
+
+G = nx.DiGraph()
+G.add_edge(0, 1, weight=5)
+G.add_edge(1, 2, weight=-3)
+G.add_edge(0, 2, weight=8)
+G.add_edge(2, 3, weight=2)
+
+# HJS 2025 — returns dict {node: distance} or None on negative cycle
+dist = hjs_sssp.sssp(G, source=0)
+# {0: 0, 1: 5, 2: 2, 3: 4}
+
+# Goldberg's algorithm
+dist = hjs_sssp.goldberg(G, source=0)
+
+# Bellman-Ford
+dist = hjs_sssp.bellman_ford(G, source=0)
+```
+
+All three functions share the same signature:
+
+```python
+hjs_sssp.sssp(digraph, source, *, weight="weight", default_weight=1)
+```
+
+- `digraph` — any object with `.nodes()` and `.edges(data=True)` (e.g. `nx.DiGraph`)
+- `source` — source node (any hashable Python object)
+- `weight` — edge attribute name to read as integer weight (default: `"weight"`)
+- `default_weight` — fallback weight when the attribute is absent (default: `1`)
+
+Returns `None` if the graph contains a negative-weight cycle; otherwise a `dict` mapping
+each node to its shortest distance (`None` for unreachable nodes).
 
 ---
 
