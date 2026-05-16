@@ -4,6 +4,11 @@ on:
   push:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      run_benchmarks:
+        description: 'Run cargo bench and include the Criterion HTML report in Pages'
+        type: boolean
+        default: false
 
 # Allow only one concurrent deployment so a newer push cancels an in-progress one.
 concurrency:
@@ -11,8 +16,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build docs
+  build-docs:
+    name: Build rustdoc
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,14 +48,61 @@ jobs:
           echo '<meta http-equiv="refresh" content="0; url=hjs_sssp/index.html">' \
             > target/doc/index.html
 
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+      # Copy committed plot SVGs so they are accessible on GH Pages.
+      - name: Copy plot SVGs into doc root
+        run: cp -r docs/plots target/doc/plots
+
+      - name: Upload rustdoc artifact
+        uses: actions/upload-artifact@v4
         with:
+          name: rustdoc
           path: target/doc
+
+  build-bench:
+    name: Run benchmarks
+    # Only run when explicitly requested via workflow_dispatch.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_benchmarks }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-bench-
+
+      - name: Run benchmarks
+        run: cargo bench
+        env:
+          CARGO_PROFILE_BENCH_LTO: fat
+          CARGO_PROFILE_BENCH_CODEGEN_UNITS: "1"
+
+      # Add a redirect so /criterion/ lands on the Criterion report index.
+      - name: Add criterion index redirect
+        run: |
+          echo '<meta http-equiv="refresh" content="0; url=report/index.html">' \
+            > target/criterion/index.html
+
+      - name: Upload criterion artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion
+          path: target/criterion
 
   deploy:
     name: Deploy to GitHub Pages
-    needs: build
+    needs: [build-docs, build-bench]
+    # Run when build-docs succeeded, regardless of whether build-bench ran.
+    if: ${{ always() && needs.build-docs.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       pages: write
@@ -59,6 +111,26 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
+      - name: Download rustdoc artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rustdoc
+          path: site
+
+      # The criterion artifact is only present when build-bench ran.
+      - name: Download criterion artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: criterion
+          path: site/criterion
+        continue-on-error: true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
       - name: Deploy
         id: deploy
         uses: actions/deploy-pages@v4
+

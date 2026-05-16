@@ -20,4 +20,6 @@ build
 *.csv
 *.json
 *.svg
+# committed documentation assets
+!docs/**
 **/__pycache__/**/*

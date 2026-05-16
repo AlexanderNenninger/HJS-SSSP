@@ -88,9 +88,9 @@ case in isolation. In practice `sssp` is always faster because it falls back to
 | Need the best theoretical complexity | `sssp` (HJS) |
 | Profiling / testing the recursive HJS case | `sssp_hjs_forced` |
 
-In practice `sssp` and `goldberg` perform almost identically at the sizes benchmarked here
-(up to n = 800). Both are vastly better than `bellman_ford` once the graph becomes even
-slightly dense (m ≫ √n).
+In practice `sssp` and Goldberg perform almost identically across all benchmarked sizes
+(up to n = 100 000). Both are vastly better than `bellman_ford` once the graph becomes
+even slightly dense (m ≫ √n).
 
 ---
 
@@ -202,57 +202,52 @@ for sparse inputs).
 
 ## Benchmarks
 
-Measured on Apple M-series hardware with `[profile.bench] lto = "fat" codegen-units = 1`.
-Run with:
+Measured on Apple M-series hardware with `[profile.bench] lto = "fat" codegen-units = 1`,
+`sample_size(10)`, `measurement_time(5s)`. The interactive Criterion HTML report is
+published on [GitHub Pages](../../criterion/report/index.html) and regenerated on demand
+via the **Docs** workflow (`Run benchmarks` input).
+
+Run locally with:
 
 ```sh
 cargo bench                        # serial
 cargo bench --features parallel    # with Rayon (thresholds apply, no difference at these sizes)
 ```
 
-### Sparse graph — random directed, ~4 edges per node, weights ∈ [−10, 10]
+### Sparse random graph — 4n arcs, weights ∈ [−n, n]
 
-| n   | m      | Goldberg  | Bellman-Ford |
-|-----|--------|-----------|--------------|
-|  50 |   ~200 |  16.7 µs  |   7.0 µs     |
-| 100 |   ~400 |  43.9 µs  |  32.7 µs     |
-| 200 |   ~800 |   127 µs  |   129 µs     |
-| 400 | ~1 600 |   361 µs  |   531 µs     |
-| 800 | ~3 200 |  1.04 ms  |  2.43 ms     |
+| n | m | HJS | Goldberg | Bellman-Ford |
+|---|---|-----|----------|--------------|
+| 1 000 | 4 000 | 0.62 ms | 0.62 ms | 4.7 ms |
+| 10 000 | 40 000 | 22 ms | 24 ms | — |
+| 100 000 | 400 000 | **1.30 s** | **1.32 s** | — |
 
-`sssp` (HJS) produces identical timings to Goldberg at all these sizes — see below.
+![sprand lines plot](docs/plots/sprand.svg)
 
-### Path graph — linear chain 0→1→…→(n−1), weights ∈ [−5, 5], no negative cycle
+### Grid graph — r×c grid, weights ∈ [−n, n]
 
-| n    | Goldberg  | Bellman-Ford |
-|------|-----------|--------------|
-|  200 |  74.1 µs  |    585 ns    |
-|  500 |   269 µs  |   1.39 µs    |
-| 1000 |   829 µs  |   2.74 µs    |
+| n | rows×cols | HJS | Goldberg |
+|---|-----------|-----|---------|
+| 10 000 | 100×100 | 6.5 ms | 7.4 ms |
+| 99 856 | 316×316 | **125 ms** | **136 ms** |
 
-Bellman-Ford's early-termination makes it orders of magnitude faster on path-like graphs;
-Goldberg/HJS apply all scaling phases regardless of structure.
+![spgrid lines plot](docs/plots/spgrid.svg)
 
-### Grid graph — r×c DAG-like grid, weights ∈ [−3, 3]
+### Path graph — linear chain, weights ∈ [−n, n]
 
-| n (r×c)       | Goldberg  | Bellman-Ford |
-|---------------|-----------|--------------|
-| 100  (10×10)  |  18.2 µs  |    505 ns    |
-| 225  (15×15)  |  43.0 µs  |   1.10 µs    |
-| 400  (20×20)  |  84.8 µs  |   1.98 µs    |
+| n | HJS | Goldberg | Bellman-Ford |
+|---|-----|----------|--------------|
+| 1 000 | 0.73 ms | 0.75 ms | 3 µs |
+| 10 000 | 18 ms | 18 ms | — |
+| 100 000 | **515 ms** | **513 ms** | — |
 
-### Large dense graph — HJS-forced vs Goldberg, ~10 edges per node, weights ∈ [−100, 100]
+Bellman-Ford's early-termination makes it orders of magnitude faster on path graphs;
+Goldberg/HJS apply all scaling phases regardless of graph structure.
 
-`HJS-forced` (threshold=2) fires the full path-cover recursion at every level; this is the
-only benchmark where the recursive HJS machinery actually executes.
+![sppath lines plot](docs/plots/sppath.svg)
 
-| n      | m (≈10n)   | HJS-forced | Goldberg  |
-|--------|------------|------------|-----------|
-| 25 000 | ~250 000   |    950 ms  |   747 ms  |
-| 62 500 | ~625 000   |   3.46 s   |  3.36 s   |
-
-The forced recursion is still slower than Goldberg at these sizes — the path-cover and G″
-construction overhead has not yet been recovered by the asymptotically cheaper inner loop.
+Bellman-Ford and `HJS-forced` are excluded above n = 2 000 (O(mn) and forced-recursion
+overhead respectively make them impractical at large n).
 
 ---
 
