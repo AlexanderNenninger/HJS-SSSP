@@ -113,8 +113,8 @@ hjs-path-finding = { path = ".", features = ["parallel"] }
 Basic example:
 
 ```rust,no_run
-use hjs_path_finding::graph::{Graph, NodeId};
-use hjs_path_finding::sssp::{sssp, INF};
+use hjs_sssp::graph::{Graph, NodeId};
+use hjs_sssp::sssp::{sssp, INF};
 
 // Build a small graph with a negative edge.
 let mut g = Graph::with_capacity(4, 4);
@@ -199,6 +199,35 @@ phases regardless of negative-edge structure.
 
 Grid graphs are nearly-DAG structures where negative edges seldom form cycles. Bellman-Ford
 is again extremely fast. HJS and Goldberg scale with m rather than the cycle structure.
+
+---
+
+## Benchmark Graphs
+
+Run `cargo bench` to regenerate all benchmark comparisons in `target/criterion/`. The SVG
+graphs below show algorithm performance across different graph types and input sizes:
+
+### Sparse graphs
+
+![sparse_graph comparison](target/criterion/sparse_graph/report/lines.svg)
+
+All four algorithms compared at n ∈ {50, 100, 200, 400, 800}. HJS and Goldberg are nearly
+identical and stay well below BF; both plateau at similar time-complexity behavior.
+
+### Path graphs
+
+![path_graph comparison](target/criterion/path_graph/report/lines.svg)
+
+Path graphs expose Bellman-Ford's advantage: with at most one negative edge per path,
+early termination makes BF dramatically faster. HJS and Goldberg apply all scaling phases
+regardless, so they remain slow.
+
+### Grid graphs
+
+![grid_graph comparison](target/criterion/grid_graph/report/lines.svg)
+
+Grid graphs (nearly-DAG) again show BF is fastest due to minimal cycles. HJS and Goldberg
+scale similarly, limited by the potential-adjustment cost more than the recursion depth.
 
 ---
 
