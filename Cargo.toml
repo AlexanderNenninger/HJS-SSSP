@@ -33,6 +33,7 @@ pprof = { version = "0.15.0", features = ["flamegraph", "criterion"] }
 [profile.bench]
 lto = "fat"
 codegen-units = 1
+debug = true
 
 [[bench]]
 name = "sssp"
