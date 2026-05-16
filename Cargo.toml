@@ -23,6 +23,9 @@ pyo3 = { version = "0.23", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+
+# pprof uses Unix-only APIs (nix, pthread); exclude it on Windows.
+[target.'cfg(not(target_os = "windows"))'.dev-dependencies]
 pprof = { version = "0.15.0", features = ["flamegraph", "criterion"] }
 
 [profile.bench]

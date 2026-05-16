@@ -35,7 +35,7 @@ fn build_graph<'py>(
     let node_to_idx = PyDict::new(py);
     let mut idx_to_node: Vec<PyObject> = Vec::new();
 
-    for item in digraph.call_method0("nodes")?.iter()? {
+    for item in digraph.call_method0("nodes")?.try_iter()? {
         let node = item?;
         if node_to_idx.get_item(&node)?.is_none() {
             node_to_idx.set_item(&node, idx_to_node.len())?;
@@ -52,7 +52,7 @@ fn build_graph<'py>(
     kwargs.set_item("data", true)?;
     let edges = digraph.call_method("edges", (), Some(&kwargs))?;
 
-    for item in edges.iter()? {
+    for item in edges.try_iter()? {
         let edge = item?;
         let u_node = edge.get_item(0usize)?;
         let v_node = edge.get_item(1usize)?;
