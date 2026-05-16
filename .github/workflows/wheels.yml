@@ -113,12 +113,15 @@ jobs:
           path: dist/
 
       - name: Install wheel and test dependencies
-        # Install into an explicit venv so uv run doesn't re-sync from pyproject.toml.
+        # shell: bash ensures dist/*.whl glob is expanded on Windows
+        # (PowerShell does not expand globs in arguments to external programs).
+        shell: bash
         run: |
           uv venv --python ${{ matrix.python-version }} .test-venv
           uv pip install --python .test-venv networkx dist/*.whl
 
       - name: Run Python tests
+        shell: bash
         run: uv run --python .test-venv python -m unittest discover -s tests -v
 
   # ── Attach wheels and sdist to the GitHub Release on version tags ───────────
