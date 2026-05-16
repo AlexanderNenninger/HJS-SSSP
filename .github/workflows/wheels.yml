@@ -27,8 +27,8 @@ jobs:
             target: aarch64-unknown-linux-gnu
             manylinux: auto
 
-          # ── macOS x86-64 ──────────────────────────────────────────────────
-          - runner: macos-13       # Intel runner
+          # ── macOS x86-64 (cross-compiled from arm64 runner) ──────────────
+          - runner: macos-latest
             target: x86_64-apple-darwin
             manylinux: ""
 
