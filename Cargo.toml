@@ -7,6 +7,7 @@ edition = "2024"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+pprof = { version = "0.15.0", features = ["flamegraph", "criterion"] }
 
 [[bench]]
 name = "sssp"
