@@ -6,23 +6,30 @@ pub struct NodeId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EdgeId(pub u32);
 
+/// Sentinel value meaning "no edge" — substitutes for `Option<EdgeId>` in the
+/// arena to halve the size of the linkage fields (4 bytes vs 8 bytes each).
+const NO_EDGE: u32 = u32::MAX;
+
 /// A node stored in the arena.
 struct Node {
-    /// Head of the intrusive singly-linked list of outgoing edges.
-    first_out: Option<EdgeId>,
-    /// Head of the intrusive singly-linked list of incoming edges.
-    first_in: Option<EdgeId>,
+    /// Head of the intrusive singly-linked list of outgoing edges (NO_EDGE = empty).
+    first_out: u32,
+    /// Head of the intrusive singly-linked list of incoming edges (NO_EDGE = empty).
+    first_in: u32,
 }
 
 /// An edge stored in the arena.
+///
+/// Field order chosen to pack hot Dijkstra fields (target, next_out, weight)
+/// into the first 16 bytes — no padding, one cache line covers two full edges.
 struct Edge {
-    source: NodeId,
     target: NodeId,
+    /// Next outgoing edge from the same source (NO_EDGE = last in list).
+    next_out: u32,
     weight: i64,
-    /// Next outgoing edge from the same source (linked list through the arena).
-    next_out: Option<EdgeId>,
-    /// Next incoming edge into the same target (linked list through the arena).
-    next_in: Option<EdgeId>,
+    source: NodeId,
+    /// Next incoming edge into the same target (NO_EDGE = last in list).
+    next_in: u32,
 }
 
 /// Directed weighted graph backed by two flat arenas (nodes and edges).
@@ -56,8 +63,8 @@ impl Graph {
     pub fn add_node(&mut self) -> NodeId {
         let id = NodeId(self.nodes.len() as u32);
         self.nodes.push(Node {
-            first_out: None,
-            first_in: None,
+            first_out: NO_EDGE,
+            first_in: NO_EDGE,
         });
         id
     }
@@ -69,8 +76,8 @@ impl Graph {
         self.nodes.reserve(count);
         for _ in 0..count {
             self.nodes.push(Node {
-                first_out: None,
-                first_in: None,
+                first_out: NO_EDGE,
+                first_in: NO_EDGE,
             });
         }
         first
@@ -94,15 +101,15 @@ impl Graph {
         let prev_in = self.nodes[target.0 as usize].first_in;
 
         self.edges.push(Edge {
-            source,
             target,
-            weight,
             next_out: prev_out,
+            weight,
+            source,
             next_in: prev_in,
         });
 
-        self.nodes[source.0 as usize].first_out = Some(id);
-        self.nodes[target.0 as usize].first_in = Some(id);
+        self.nodes[source.0 as usize].first_out = id.0;
+        self.nodes[target.0 as usize].first_in = id.0;
 
         id
     }
@@ -120,34 +127,48 @@ impl Graph {
     }
 
     /// Source node of an edge.
+    #[inline]
     pub fn source(&self, e: EdgeId) -> NodeId {
         self.edges[e.0 as usize].source
     }
 
     /// Target node of an edge.
+    #[inline]
     pub fn target(&self, e: EdgeId) -> NodeId {
         self.edges[e.0 as usize].target
     }
 
     /// Weight of an edge.
+    #[inline]
     pub fn weight(&self, e: EdgeId) -> i64 {
         self.edges[e.0 as usize].weight
     }
 
     /// Iterate over the outgoing edges of `node`.
+    #[inline]
     pub fn out_edges(&self, node: NodeId) -> EdgeIter<'_> {
+        let first = self.nodes[node.0 as usize].first_out;
         EdgeIter {
             graph: self,
-            current: self.nodes[node.0 as usize].first_out,
+            current: if first == NO_EDGE {
+                None
+            } else {
+                Some(EdgeId(first))
+            },
             direction: Direction::Out,
         }
     }
 
     /// Iterate over the incoming edges of `node`.
     pub fn in_edges(&self, node: NodeId) -> EdgeIter<'_> {
+        let first = self.nodes[node.0 as usize].first_in;
         EdgeIter {
             graph: self,
-            current: self.nodes[node.0 as usize].first_in,
+            current: if first == NO_EDGE {
+                None
+            } else {
+                Some(EdgeId(first))
+            },
             direction: Direction::In,
         }
     }
@@ -166,14 +187,18 @@ impl Graph {
     ///
     /// Combined with \[`next_out_edge`\](Self::next_out_edge) this allows
     /// iterating out-edges without a heap-allocated adjacency list.
+    #[inline]
     pub fn first_out_edge(&self, node: NodeId) -> Option<EdgeId> {
-        self.nodes[node.0 as usize].first_out
+        let v = self.nodes[node.0 as usize].first_out;
+        if v == NO_EDGE { None } else { Some(EdgeId(v)) }
     }
 
     /// The outgoing edge that follows `e` from the same source node, or `None`
     /// if `e` is the last outgoing edge of that node.
+    #[inline]
     pub fn next_out_edge(&self, e: EdgeId) -> Option<EdgeId> {
-        self.edges[e.0 as usize].next_out
+        let v = self.edges[e.0 as usize].next_out;
+        if v == NO_EDGE { None } else { Some(EdgeId(v)) }
     }
 }
 
@@ -200,12 +225,18 @@ pub struct EdgeIter<'g> {
 impl<'g> Iterator for EdgeIter<'g> {
     type Item = EdgeId;
 
+    #[inline]
     fn next(&mut self) -> Option<EdgeId> {
         let id = self.current?;
         let edge = &self.graph.edges[id.0 as usize];
-        self.current = match self.direction {
+        let next_raw = match self.direction {
             Direction::Out => edge.next_out,
             Direction::In => edge.next_in,
+        };
+        self.current = if next_raw == NO_EDGE {
+            None
+        } else {
+            Some(EdgeId(next_raw))
         };
         Some(id)
     }

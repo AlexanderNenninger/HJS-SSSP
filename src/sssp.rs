@@ -30,8 +30,106 @@
 //! | \[`k_sssp`\] | §5.1 recursive algorithm |
 //! | \[`sssp`\] | Theorem 1.1 outer driver |
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+// ═══════════════════════════════════════════════════════════════════════════════
+// Radix heap (monotone priority queue for integer-keyed Dijkstra)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Monotone min-heap backed by 65 radix buckets.
+///
+/// Keys must be **non-decreasing** across successive `pop` calls (the Dijkstra
+/// invariant). Push and pop are O(1) amortized for 64-bit keys, vs O(log n)
+/// for `BinaryHeap`. Negative `i64` keys are supported via sign-bit flip.
+struct RadixHeap {
+    last: u64,
+    len: usize,
+    buckets: [Vec<(u64, u32)>; 65],
+}
+
+impl RadixHeap {
+    fn new() -> Self {
+        Self {
+            last: 0,
+            len: 0,
+            buckets: std::array::from_fn(|_| Vec::new()),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, key: i64, val: u32) {
+        let k = rh_to_u64(key);
+        let b = rh_bucket(self.last, k);
+        self.buckets[b].push((k, val));
+        self.len += 1;
+    }
+
+    /// Reset the heap to empty state. O(65) — clears all bucket Vecs without
+    /// deallocating them, preserving allocated capacity for the next round.
+    ///
+    /// # Panics (debug only)
+    /// Asserts the heap is already drained — call only after popping everything.
+    #[inline]
+    fn reset(&mut self) {
+        debug_assert_eq!(
+            self.len, 0,
+            "RadixHeap::reset called with items still present"
+        );
+        self.last = 0;
+        for b in &mut self.buckets {
+            b.clear();
+        }
+    }
+
+    #[inline]
+    fn pop(&mut self) -> Option<(i64, u32)> {
+        if self.len == 0 {
+            return None;
+        }
+        if self.buckets[0].is_empty() {
+            // Find the first non-empty bucket (skip index 0).
+            let b = self.buckets[1..]
+                .iter()
+                .position(|bkt| !bkt.is_empty())
+                .map(|i| i + 1)
+                .unwrap();
+            // New `last` = minimum key in that bucket.
+            let new_last = self.buckets[b].iter().map(|&(k, _)| k).min().unwrap();
+            self.last = new_last;
+            // Redistribute the bucket's contents into their correct new buckets.
+            let items: Vec<(u64, u32)> = std::mem::take(&mut self.buckets[b]);
+            for (k, v) in items {
+                let new_b = rh_bucket(self.last, k);
+                self.buckets[new_b].push((k, v));
+            }
+        }
+        self.len -= 1;
+        let (k, v) = self.buckets[0].pop().unwrap();
+        Some((rh_to_i64(k), v))
+    }
+}
+
+/// Map a signed key to an unsigned one that preserves order (flip sign bit).
+#[inline(always)]
+fn rh_to_u64(x: i64) -> u64 {
+    (x as u64) ^ (1u64 << 63)
+}
+
+/// Inverse of `rh_to_u64`.
+#[inline(always)]
+fn rh_to_i64(x: u64) -> i64 {
+    (x ^ (1u64 << 63)) as i64
+}
+
+/// Bucket index for `key` given the current lower bound `last`.
+/// Bucket 0 iff key == last; bucket i (1..=64) iff MSB of (last XOR key) is bit i-1.
+#[inline(always)]
+fn rh_bucket(last: u64, key: u64) -> usize {
+    let diff = last ^ key;
+    if diff == 0 {
+        0
+    } else {
+        64 - diff.leading_zeros() as usize
+    }
+}
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -79,10 +177,10 @@ pub fn dijkstra(g: &Graph, source: NodeId) -> Vec<i64> {
     dist[source.0 as usize] = 0;
 
     // Min-heap of (distance, node).
-    let mut heap: BinaryHeap<Reverse<(i64, u32)>> = BinaryHeap::new();
-    heap.push(Reverse((0, source.0)));
+    let mut heap = RadixHeap::new();
+    heap.push(0, source.0);
 
-    while let Some(Reverse((d, u))) = heap.pop() {
+    while let Some((d, u)) = heap.pop() {
         if d > dist[u as usize] {
             continue; // stale entry
         }
@@ -91,7 +189,7 @@ pub fn dijkstra(g: &Graph, source: NodeId) -> Vec<i64> {
             let nd = d.saturating_add(g.weight(e));
             if nd < dist[v.0 as usize] {
                 dist[v.0 as usize] = nd;
-                heap.push(Reverse((nd, v.0)));
+                heap.push(nd, v.0);
             }
         }
     }
@@ -210,15 +308,15 @@ pub fn sssp_cross_scc(g: &Graph, source: NodeId) -> Vec<i64> {
         let nodes = &scc_nodes[scc_id];
 
         // Mini Dijkstra within the SCC.
-        let mut heap: BinaryHeap<Reverse<(i64, u32)>> = BinaryHeap::new();
+        let mut heap = RadixHeap::new();
         for &v in nodes {
             if dist[v as usize] < INF {
-                heap.push(Reverse((dist[v as usize], v)));
+                heap.push(dist[v as usize], v);
             }
         }
 
         // Membership test: `comp[v] == scc_id` — free compared to a HashSet.
-        while let Some(Reverse((d, u))) = heap.pop() {
+        while let Some((d, u)) = heap.pop() {
             if d > dist[u as usize] {
                 continue;
             }
@@ -230,7 +328,7 @@ pub fn sssp_cross_scc(g: &Graph, source: NodeId) -> Vec<i64> {
                 let nd = d.saturating_add(g.weight(e));
                 if nd < dist[v.0 as usize] {
                     dist[v.0 as usize] = nd;
-                    heap.push(Reverse((nd, v.0)));
+                    heap.push(nd, v.0);
                 }
             }
         }
@@ -271,61 +369,85 @@ pub fn sssp_cross_scc(g: &Graph, source: NodeId) -> Vec<i64> {
 pub fn sssp_few_negative(g: &Graph, source: NodeId, k: usize) -> Option<Vec<i64>> {
     let n = g.node_count();
 
-    // Partition edges into non-negative and negative.
-    let neg_edges: Vec<EdgeId> = g.edges().filter(|&e| g.weight(e) < 0).collect();
+    // Pre-split edges: non-negative CSR adjacency + flat (src, tgt, weight) tuples.
+    // Replaces linked-list pointer-chasing with sequential slice access in the hot
+    // Dijkstra loop and eliminates g.source/target/weight indirection in BF passes.
+    let mut nonneg_count = vec![0u32; n];
+    let mut neg_raw: Vec<(u32, u32, i64)> = Vec::new();
+    for e in g.edges() {
+        let w = g.weight(e);
+        if w < 0 {
+            neg_raw.push((g.source(e).0, g.target(e).0, w));
+        } else {
+            nonneg_count[g.source(e).0 as usize] += 1;
+        }
+    }
+    let mut nonneg_head = vec![0u32; n + 1];
+    for i in 0..n {
+        nonneg_head[i + 1] = nonneg_head[i] + nonneg_count[i];
+    }
+    let nonneg_total = nonneg_head[n] as usize;
+    let mut nonneg_adj: Vec<(u32, i64)> = vec![(0, 0); nonneg_total];
+    {
+        let mut fill_pos = nonneg_head[..n].to_vec();
+        for e in g.edges() {
+            let w = g.weight(e);
+            if w >= 0 {
+                let u = g.source(e).0 as usize;
+                let idx = fill_pos[u] as usize;
+                nonneg_adj[idx] = (g.target(e).0, w);
+                fill_pos[u] += 1;
+            }
+        }
+    }
 
     let mut dist = vec![INF; n];
     dist[source.0 as usize] = 0;
 
-    // Track which nodes to seed each Dijkstra pass.
-    // Start with the source; after each BF pass seed only the nodes whose
-    // distance was updated — re-processing all finite-distance nodes every
-    // round is wasteful when few nodes change per BF round.
+    // Seed tracking: only BF-updated nodes enter the next Dijkstra heap.
     let mut in_seed = vec![false; n];
     let mut seed_nodes: Vec<u32> = vec![source.0];
     in_seed[source.0 as usize] = true;
 
+    // Heap allocated once; reset() between rounds preserves Vec capacity.
+    let mut heap = RadixHeap::new();
+
     for _ in 0..=k {
-        // Dijkstra step: non-negative edges only, seeded from `seed_nodes`.
-        let mut heap: BinaryHeap<Reverse<(i64, u32)>> = BinaryHeap::new();
+        // Dijkstra on non-negative edges, seeded from `seed_nodes`.
+        heap.reset();
         for &v in &seed_nodes {
-            in_seed[v as usize] = false; // reset in-place for the next round
-            heap.push(Reverse((dist[v as usize], v)));
+            in_seed[v as usize] = false;
+            heap.push(dist[v as usize], v);
         }
         seed_nodes.clear();
 
-        while let Some(Reverse((d, u))) = heap.pop() {
+        while let Some((d, u)) = heap.pop() {
             if d > dist[u as usize] {
                 continue;
             }
-            for e in g.out_edges(NodeId(u)) {
-                if g.weight(e) < 0 {
-                    continue; // skip negative
-                }
-                let v = g.target(e);
-                let nd = d.saturating_add(g.weight(e));
-                if nd < dist[v.0 as usize] {
-                    dist[v.0 as usize] = nd;
-                    heap.push(Reverse((nd, v.0)));
+            let start = nonneg_head[u as usize] as usize;
+            let end = nonneg_head[u as usize + 1] as usize;
+            for &(v, w) in &nonneg_adj[start..end] {
+                let nd = d.saturating_add(w);
+                if nd < dist[v as usize] {
+                    dist[v as usize] = nd;
+                    heap.push(nd, v);
                 }
             }
         }
 
         // Bellman-Ford pass: relax all negative edges once.
-        // Collect the nodes whose distance improved — they seed the next Dijkstra.
-        for &e in &neg_edges {
-            let u = g.source(e);
-            let v = g.target(e);
-            let du = dist[u.0 as usize];
+        for &(u, v, w) in &neg_raw {
+            let du = dist[u as usize];
             if du >= INF {
                 continue;
             }
-            let nd = du.saturating_add(g.weight(e));
-            if nd < dist[v.0 as usize] {
-                dist[v.0 as usize] = nd;
-                if !in_seed[v.0 as usize] {
-                    in_seed[v.0 as usize] = true;
-                    seed_nodes.push(v.0);
+            let nd = du.saturating_add(w);
+            if nd < dist[v as usize] {
+                dist[v as usize] = nd;
+                if !in_seed[v as usize] {
+                    in_seed[v as usize] = true;
+                    seed_nodes.push(v);
                 }
             }
         }
@@ -336,15 +458,10 @@ pub fn sssp_few_negative(g: &Graph, source: NodeId, k: usize) -> Option<Vec<i64>
     }
 
     // Negative cycle check: one more BF pass — if anything still relaxes, cycle.
-    for &e in &neg_edges {
-        let u = g.source(e);
-        let v = g.target(e);
-        let du = dist[u.0 as usize];
-        if du < INF {
-            let nd = du.saturating_add(g.weight(e));
-            if nd < dist[v.0 as usize] {
-                return None; // negative cycle detected
-            }
+    for &(u, v, w) in &neg_raw {
+        let du = dist[u as usize];
+        if du < INF && du.saturating_add(w) < dist[v as usize] {
+            return None;
         }
     }
 
@@ -726,7 +843,36 @@ pub fn k_sssp(h: &Graph, source: NodeId, k: usize, threshold: usize) -> Vec<i64>
 /// Returns `None` if a negative cycle is detected.
 pub fn sssp_minus_one(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
     let n = g.node_count();
-    let neg_edges: Vec<EdgeId> = g.edges().filter(|&e| g.weight(e) < 0).collect();
+    // Pre-split edges: non-negative CSR adjacency + flat (src, tgt, weight) tuples.
+    // Eliminates linked-list pointer-chasing and the g.weight(e)<0 branch per edge.
+    let mut nonneg_count = vec![0u32; n];
+    let mut neg_raw: Vec<(u32, u32, i64)> = Vec::new();
+    for e in g.edges() {
+        let w = g.weight(e);
+        if w < 0 {
+            neg_raw.push((g.source(e).0, g.target(e).0, w));
+        } else {
+            nonneg_count[g.source(e).0 as usize] += 1;
+        }
+    }
+    let mut nonneg_head = vec![0u32; n + 1];
+    for i in 0..n {
+        nonneg_head[i + 1] = nonneg_head[i] + nonneg_count[i];
+    }
+    let nonneg_total = nonneg_head[n] as usize;
+    let mut nonneg_adj: Vec<(u32, i64)> = vec![(0, 0); nonneg_total];
+    {
+        let mut fill_pos = nonneg_head[..n].to_vec();
+        for e in g.edges() {
+            let w = g.weight(e);
+            if w >= 0 {
+                let u = g.source(e).0 as usize;
+                let idx = fill_pos[u] as usize;
+                nonneg_adj[idx] = (g.target(e).0, w);
+                fill_pos[u] += 1;
+            }
+        }
+    }
 
     let mut dist = vec![INF; n];
     dist[source.0 as usize] = 0;
@@ -739,28 +885,29 @@ pub fn sssp_minus_one(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
     let mut seed_nodes: Vec<u32> = vec![source.0];
     in_seed[source.0 as usize] = true;
 
+    // Heap allocated once; reset() between rounds preserves Vec capacity.
+    let mut heap = RadixHeap::new();
+
     for _ in 0..=rounds {
         // Dijkstra on non-negative edges.
-        let mut heap: BinaryHeap<Reverse<(i64, u32)>> = BinaryHeap::new();
+        heap.reset();
         for &v in &seed_nodes {
             in_seed[v as usize] = false;
-            heap.push(Reverse((dist[v as usize], v)));
+            heap.push(dist[v as usize], v);
         }
         seed_nodes.clear();
 
-        while let Some(Reverse((d, u))) = heap.pop() {
+        while let Some((d, u)) = heap.pop() {
             if d > dist[u as usize] {
                 continue;
             }
-            for e in g.out_edges(NodeId(u)) {
-                if g.weight(e) < 0 {
-                    continue;
-                }
-                let v = g.target(e);
-                let nd = d.saturating_add(g.weight(e));
-                if nd < dist[v.0 as usize] {
-                    dist[v.0 as usize] = nd;
-                    heap.push(Reverse((nd, v.0)));
+            let start = nonneg_head[u as usize] as usize;
+            let end = nonneg_head[u as usize + 1] as usize;
+            for &(v, w) in &nonneg_adj[start..end] {
+                let nd = d.saturating_add(w);
+                if nd < dist[v as usize] {
+                    dist[v as usize] = nd;
+                    heap.push(nd, v);
                 }
             }
         }
@@ -769,20 +916,18 @@ pub fn sssp_minus_one(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
         // Parallel + large enough: collect-then-apply snapshot (race-free).
         // Otherwise: direct in-place mutation — no allocation per round.
         #[cfg(feature = "parallel")]
-        if neg_edges.len() >= PAR_BF_MIN_EDGES {
+        if neg_raw.len() >= PAR_BF_MIN_EDGES {
             let dist_snap: &[i64] = &dist;
-            let bf_updates: Vec<(u32, i64)> = neg_edges
+            let bf_updates: Vec<(u32, i64)> = neg_raw
                 .par_iter()
-                .filter_map(|&e| {
-                    let u = g.source(e);
-                    let v = g.target(e);
-                    let du = dist_snap[u.0 as usize];
+                .filter_map(|&(u, v, w)| {
+                    let du = dist_snap[u as usize];
                     if du >= INF {
                         return None;
                     }
-                    let nd = du.saturating_add(g.weight(e));
-                    if nd < dist_snap[v.0 as usize] {
-                        Some((v.0, nd))
+                    let nd = du.saturating_add(w);
+                    if nd < dist_snap[v as usize] {
+                        Some((v, nd))
                     } else {
                         None
                     }
@@ -800,25 +945,23 @@ pub fn sssp_minus_one(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
             // fall through to seed_nodes check
         }
         #[cfg(feature = "parallel")]
-        let _par_bf_done = neg_edges.len() >= PAR_BF_MIN_EDGES;
+        let _par_bf_done = neg_raw.len() >= PAR_BF_MIN_EDGES;
         #[cfg(not(feature = "parallel"))]
         let _par_bf_done = false;
 
         if !_par_bf_done {
             // Serial direct-mutation path.
-            for &e in &neg_edges {
-                let u = g.source(e);
-                let v = g.target(e);
-                let du = dist[u.0 as usize];
+            for &(u, v, w) in &neg_raw {
+                let du = dist[u as usize];
                 if du >= INF {
                     continue;
                 }
-                let nd = du.saturating_add(g.weight(e));
-                if nd < dist[v.0 as usize] {
-                    dist[v.0 as usize] = nd;
-                    if !in_seed[v.0 as usize] {
-                        in_seed[v.0 as usize] = true;
-                        seed_nodes.push(v.0);
+                let nd = du.saturating_add(w);
+                if nd < dist[v as usize] {
+                    dist[v as usize] = nd;
+                    if !in_seed[v as usize] {
+                        in_seed[v as usize] = true;
+                        seed_nodes.push(v);
                     }
                 }
             }
@@ -830,11 +973,9 @@ pub fn sssp_minus_one(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
     }
 
     // Negative-cycle check: one more BF pass.
-    for &e in &neg_edges {
-        let u = g.source(e);
-        let v = g.target(e);
-        let du = dist[u.0 as usize];
-        if du < INF && du.saturating_add(g.weight(e)) < dist[v.0 as usize] {
+    for &(u, v, w) in &neg_raw {
+        let du = dist[u as usize];
+        if du < INF && du.saturating_add(w) < dist[v as usize] {
             return None;
         }
     }
