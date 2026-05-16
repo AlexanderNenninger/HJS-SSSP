@@ -59,7 +59,7 @@ fn make_dense_complex_graph(n: usize, w_max: i64, seed: u64) -> (Graph, NodeId) 
 }
 
 ///
-/// Path graph 0→1→2→…→(n-1) with weights in [-w_max, w_max].
+/// Path graph 0→1→2→…→(n-1) with weights in \[-w_max, w_max\].
 /// Guaranteed no negative cycle (strictly increasing path).
 fn make_path_graph(n: usize, w_max: i64, seed: u64) -> (Graph, NodeId) {
     let mut g = Graph::with_capacity(n, n - 1);

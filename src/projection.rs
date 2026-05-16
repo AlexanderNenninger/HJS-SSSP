@@ -33,9 +33,9 @@ use crate::graph::{Graph, NodeId};
 pub struct Projection {
     /// The projection graph G'.
     pub graph: Graph,
-    /// `proj_map[v'.0]` = original node π(v').
+    /// `proj_map\[v'.0\]` = original node π(v').
     proj_map: Vec<NodeId>,
-    /// `rep[v.0]` = representative of original node v in G', or `None` if absent.
+    /// `rep\[v.0\]` = representative of original node v in G', or `None` if absent.
     rep: Vec<Option<NodeId>>,
 }
 
@@ -127,7 +127,7 @@ impl Projection {
         }
     }
 
-    /// Construct the **layered projection** `Layer((pieces[0], …, pieces[z-1]) → G)`.
+    /// Construct the **layered projection** `Layer((pieces\[0\], …, pieces\[z-1\]) → G)`.
     ///
     /// Implements Definition 4.7 of Haeupler–Jiang–Saranurak (2025).
     ///
@@ -135,10 +135,10 @@ impl Projection {
     ///
     /// **Step 0 — disjoint union.** All piece graphs are embedded into a
     /// single result graph. Piece i occupies result node ids
-    /// `[offsets[i], offsets[i+1])`.
+    /// `\[offsets\[i\], offsets\[i+1\])`.
     ///
     /// **Step 1 — internal edges.** Every edge inside piece i is copied into
-    /// the result with source and target shifted by `offsets[i]`.
+    /// the result with source and target shifted by `offsets\[i\]`.
     ///
     /// **Step 2 — representatives.** For each original node v, its global
     /// representative is its representative in the first (lowest-index) piece
@@ -160,7 +160,7 @@ impl Projection {
         );
 
         // ── Offsets ───────────────────────────────────────────────────────
-        // offsets[i] = first result-graph node id belonging to piece i.
+        // offsets\[i\] = first result-graph node id belonging to piece i.
         let mut offsets: Vec<u32> = Vec::with_capacity(pieces.len() + 1);
         offsets.push(0);
         for p in &pieces {

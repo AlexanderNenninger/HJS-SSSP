@@ -164,7 +164,7 @@ impl Graph {
 
     /// First outgoing edge from `node`, or `None` if there are none.
     ///
-    /// Combined with [`next_out_edge`](Self::next_out_edge) this allows
+    /// Combined with \[`next_out_edge`\](Self::next_out_edge) this allows
     /// iterating out-edges without a heap-allocated adjacency list.
     pub fn first_out_edge(&self, node: NodeId) -> Option<EdgeId> {
         self.nodes[node.0 as usize].first_out
