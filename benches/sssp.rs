@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, SamplingMode, black_box, criterion_group, criterion_main};
 use hjs_path_finding::graph::{Graph, NodeId};
-use hjs_path_finding::sssp::{bellman_ford, sssp};
+use hjs_path_finding::sssp::{bellman_ford, goldberg, sssp};
 
 // ── Graph generators ──────────────────────────────────────────────────────────
 
@@ -91,12 +91,17 @@ fn bench_sparse(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(3));
 
-    for &n in &[50usize, 100, 200, 400] {
+    for &n in &[50usize, 100, 200, 400, 800, 1600] {
         let (g, src) = make_sparse_graph(n, 10, 42);
 
         group.bench_with_input(BenchmarkId::new("HJS", n), &(&g, src), |b, &(g, src)| {
             b.iter(|| sssp(black_box(g), black_box(src)))
         });
+        group.bench_with_input(
+            BenchmarkId::new("Goldberg", n),
+            &(&g, src),
+            |b, &(g, src)| b.iter(|| goldberg(black_box(g), black_box(src))),
+        );
         group.bench_with_input(
             BenchmarkId::new("BellmanFord", n),
             &(&g, src),
@@ -113,12 +118,17 @@ fn bench_path(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(3));
 
-    for &n in &[200usize, 500, 1000] {
+    for &n in &[200usize, 500, 1000, 2000, 5000] {
         let (g, src) = make_path_graph(n, 5, 99);
 
         group.bench_with_input(BenchmarkId::new("HJS", n), &(&g, src), |b, &(g, src)| {
             b.iter(|| sssp(black_box(g), black_box(src)))
         });
+        group.bench_with_input(
+            BenchmarkId::new("Goldberg", n),
+            &(&g, src),
+            |b, &(g, src)| b.iter(|| goldberg(black_box(g), black_box(src))),
+        );
         group.bench_with_input(
             BenchmarkId::new("BellmanFord", n),
             &(&g, src),
@@ -135,7 +145,7 @@ fn bench_grid(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(3));
 
-    for &(r, c_) in &[(10usize, 10usize), (15, 15), (20, 20)] {
+    for &(r, c_) in &[(10usize, 10usize), (15, 15), (20, 20), (30, 30), (50, 50)] {
         let label = r * c_;
         let (g, src) = make_grid_graph(r, c_, 3, 7);
 
@@ -143,6 +153,11 @@ fn bench_grid(c: &mut Criterion) {
             BenchmarkId::new("HJS", label),
             &(&g, src),
             |b, &(g, src)| b.iter(|| sssp(black_box(g), black_box(src))),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("Goldberg", label),
+            &(&g, src),
+            |b, &(g, src)| b.iter(|| goldberg(black_box(g), black_box(src))),
         );
         group.bench_with_input(
             BenchmarkId::new("BellmanFord", label),

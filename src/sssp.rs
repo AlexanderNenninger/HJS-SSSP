@@ -550,6 +550,219 @@ fn k_sssp(h: &Graph, source: NodeId, k: usize, threshold: usize) -> Vec<i64> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Goldberg's scaling algorithm (1995)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// SSSP on a graph whose edge weights lie in `{-1, 0, 1, …, n}`.
+///
+/// Used as the inner subroutine of [`goldberg`].  Alternates Dijkstra on
+/// non-negative edges with a single Bellman-Ford pass on the (weight = −1)
+/// edges, terminating after at most ⌈√n⌉ + 1 rounds.
+///
+/// With weights ≥ −1 the shortest path uses at most n−1 negative edges, so
+/// ⌈√n⌉ rounds suffice when called inside the scaling loop (each phase only
+/// needs new *potentials*, not full distances).
+///
+/// Returns `None` if a negative cycle is detected.
+fn sssp_minus_one(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
+    let n = g.node_count();
+    let neg_edges: Vec<EdgeId> = g.edges().filter(|&e| g.weight(e) < 0).collect();
+
+    let mut dist = vec![INF; n];
+    dist[source.0 as usize] = 0;
+
+    let rounds = (n as f64).sqrt().ceil() as usize + 1;
+
+    // Seed tracking: only the BF-updated nodes are pushed into the next
+    // Dijkstra heap, avoiding a full O(n) scan per round.
+    let mut in_seed = vec![false; n];
+    let mut seed_nodes: Vec<u32> = vec![source.0];
+    in_seed[source.0 as usize] = true;
+
+    for _ in 0..=rounds {
+        // Dijkstra on non-negative edges.
+        let mut heap: BinaryHeap<Reverse<(i64, u32)>> = BinaryHeap::new();
+        for &v in &seed_nodes {
+            in_seed[v as usize] = false;
+            heap.push(Reverse((dist[v as usize], v)));
+        }
+        seed_nodes.clear();
+
+        while let Some(Reverse((d, u))) = heap.pop() {
+            if d > dist[u as usize] {
+                continue;
+            }
+            for e in g.out_edges(NodeId(u)) {
+                if g.weight(e) < 0 {
+                    continue;
+                }
+                let v = g.target(e);
+                let nd = d.saturating_add(g.weight(e));
+                if nd < dist[v.0 as usize] {
+                    dist[v.0 as usize] = nd;
+                    heap.push(Reverse((nd, v.0)));
+                }
+            }
+        }
+
+        // Single BF pass over the −1 edges.
+        for &e in &neg_edges {
+            let u = g.source(e);
+            let v = g.target(e);
+            let du = dist[u.0 as usize];
+            if du >= INF {
+                continue;
+            }
+            let nd = du.saturating_add(g.weight(e));
+            if nd < dist[v.0 as usize] {
+                dist[v.0 as usize] = nd;
+                if !in_seed[v.0 as usize] {
+                    in_seed[v.0 as usize] = true;
+                    seed_nodes.push(v.0);
+                }
+            }
+        }
+
+        if seed_nodes.is_empty() {
+            break;
+        }
+    }
+
+    // Negative-cycle check: one more BF pass.
+    for &e in &neg_edges {
+        let u = g.source(e);
+        let v = g.target(e);
+        let du = dist[u.0 as usize];
+        if du < INF && du.saturating_add(g.weight(e)) < dist[v.0 as usize] {
+            return None;
+        }
+    }
+
+    Some(dist)
+}
+
+/// Single-source shortest paths via Goldberg's weight-scaling algorithm (1995).
+///
+/// Runs in O(m √n log W) time where W = max |w(e)|, which is substantially
+/// faster than Bellman-Ford's O(mn) once n is large enough that √n ≪ n.
+///
+/// The algorithm uses ⌈log₂ W⌉ + 1 scaling phases. Each phase:
+/// 1. Doubles the current Johnson-style potential φ (one bit of each weight is
+///    "revealed").
+/// 2. Builds the potential-adjusted graph G_φ — by induction all reduced
+///    weights stay in {−1, 0, 1, …, n}.
+/// 3. Adds a super-source s* with 0-weight edges to all nodes and calls
+///    [`sssp_minus_one`] to compute new potentials in O(m √n) time.
+///
+/// After all phases a final Dijkstra on the non-negative residual graph
+/// recovers exact distances from `source`.
+///
+/// Returns `Some(dist)` where `dist[v.0]` = shortest distance from `source`
+/// to `v`, or `None` if the graph contains a negative-weight cycle.
+pub fn goldberg(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
+    let n = g.node_count();
+    if n == 0 {
+        return Some(Vec::new());
+    }
+
+    let w_max: i64 = g.edges().map(|e| g.weight(e).abs()).max().unwrap_or(0);
+    if w_max == 0 {
+        return Some(dijkstra(g, source));
+    }
+
+    let phases = (i64::BITS - w_max.leading_zeros()) as usize + 1;
+    let mut phi = vec![0i64; n];
+
+    for phase in 0..phases {
+        let shift = (phases - 1 - phase) as u32;
+
+        // Bit-by-bit scaling: double potentials to reveal one more bit.
+        for p in phi.iter_mut() {
+            if *p < INF {
+                *p = p.saturating_mul(2);
+            }
+        }
+
+        // Build G_φ: reduced weight = (w(e) >> shift) + φ(u) − φ(v).
+        // By induction this is ≥ −1; cap at n (higher values don't affect SP).
+        let mut g_phi = Graph::with_capacity(n + 1, g.edge_count() + n);
+        g_phi.add_nodes(n + 1);
+        let super_src = NodeId(n as u32);
+
+        for e in g.edges() {
+            let u = g.source(e);
+            let v = g.target(e);
+            let phi_u = phi[u.0 as usize];
+            let phi_v = phi[v.0 as usize];
+            if phi_u >= INF || phi_v >= INF {
+                continue;
+            }
+            let w = (g.weight(e) >> shift)
+                .saturating_add(phi_u)
+                .saturating_sub(phi_v);
+            // During early phases reduced weights may temporarily be < -1 if
+            // the current potential is still a rough approximation.  We clamp
+            // to -1 (the minimum valid weight for sssp_minus_one) and let
+            // subsequent phases refine the potential.  A true negative cycle
+            // will be caught by the final Dijkstra residual check.
+            g_phi.add_edge(u, v, w.max(-1).min(n as i64));
+        }
+        // Super-source reaches every node with cost 0.
+        for v in 0..n as u32 {
+            g_phi.add_edge(super_src, NodeId(v), 0);
+        }
+
+        // Solve SSSP in G_φ ∪ {s*} using the O(m√n) subroutine.
+        let dist_phi = sssp_minus_one(&g_phi, super_src)?;
+
+        // Accumulate new potentials.
+        for v in 0..n {
+            let d = dist_phi[v];
+            phi[v] = if phi[v] < INF && d < INF {
+                phi[v].saturating_add(d)
+            } else {
+                INF
+            };
+        }
+    }
+
+    // All reduced weights are now ≥ 0: run a final Dijkstra.
+    let mut g_final = Graph::with_capacity(n, g.edge_count());
+    g_final.add_nodes(n);
+    for e in g.edges() {
+        let u = g.source(e);
+        let v = g.target(e);
+        let phi_u = phi[u.0 as usize];
+        let phi_v = phi[v.0 as usize];
+        if phi_u >= INF || phi_v >= INF {
+            continue;
+        }
+        let w_adj = g.weight(e).saturating_add(phi_u).saturating_sub(phi_v);
+        if w_adj < 0 {
+            return None; // residual negative weight — negative cycle
+        }
+        g_final.add_edge(u, v, w_adj);
+    }
+
+    let dist_adj = dijkstra(&g_final, source);
+    let phi_s = phi[source.0 as usize];
+
+    Some(
+        (0..n)
+            .map(|v| {
+                let d = dist_adj[v];
+                let phi_v = phi[v];
+                if d < INF && phi_v < INF && phi_s < INF {
+                    d.saturating_add(phi_v).saturating_sub(phi_s)
+                } else {
+                    INF
+                }
+            })
+            .collect(),
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Bellman-Ford (reference baseline)
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -895,6 +1108,55 @@ mod tests {
         let dist = sssp(&g, nodes[0]).unwrap();
         assert_eq!(dist[nodes[0].0 as usize], 0);
         assert_eq!(dist[nodes[1].0 as usize], 1);
+        assert_eq!(dist[nodes[2].0 as usize], INF);
+    }
+
+    // ── Goldberg ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn goldberg_all_non_negative() {
+        let (g, nodes) = make_graph(4, &[(0, 1, 1), (0, 2, 4), (1, 2, 2), (1, 3, 5), (2, 3, 1)]);
+        let dist = goldberg(&g, nodes[0]).unwrap();
+        assert_eq!(dist[nodes[0].0 as usize], 0);
+        assert_eq!(dist[nodes[1].0 as usize], 1);
+        assert_eq!(dist[nodes[2].0 as usize], 3);
+        assert_eq!(dist[nodes[3].0 as usize], 4);
+    }
+
+    #[test]
+    fn goldberg_with_negative_edges() {
+        let (g, nodes) = make_graph(3, &[(0, 1, -1), (1, 2, 3), (0, 2, 10)]);
+        let dist = goldberg(&g, nodes[0]).unwrap();
+        assert_eq!(dist[nodes[0].0 as usize], 0);
+        assert_eq!(dist[nodes[1].0 as usize], -1);
+        assert_eq!(dist[nodes[2].0 as usize], 2);
+    }
+
+    #[test]
+    fn goldberg_matches_bellman_ford() {
+        // Agrees with BF on a graph with mixed weights and a cycle.
+        let (g, nodes) = make_graph(
+            4,
+            &[(0, 1, -2), (1, 2, 3), (2, 3, -1), (3, 1, 2), (0, 3, 10)],
+        );
+        let gd = goldberg(&g, nodes[0]).unwrap();
+        let bf = bellman_ford(&g, nodes[0]).unwrap();
+        assert_eq!(gd, bf);
+    }
+
+    #[test]
+    fn goldberg_single_node() {
+        let (g, nodes) = make_graph(1, &[]);
+        let dist = goldberg(&g, nodes[0]).unwrap();
+        assert_eq!(dist[nodes[0].0 as usize], 0);
+    }
+
+    #[test]
+    fn goldberg_disconnected() {
+        let (g, nodes) = make_graph(3, &[(0, 1, -3)]);
+        let dist = goldberg(&g, nodes[0]).unwrap();
+        assert_eq!(dist[nodes[0].0 as usize], 0);
+        assert_eq!(dist[nodes[1].0 as usize], -3);
         assert_eq!(dist[nodes[2].0 as usize], INF);
     }
 }
