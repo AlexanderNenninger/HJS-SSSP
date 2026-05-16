@@ -219,7 +219,7 @@ fn bench_large(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(300));
     group.measurement_time(Duration::from_secs(1));
 
-    for &n in &[5000usize, 12500] {
+    for &n in &[25000usize, 62500] {
         let (g, src) = make_dense_complex_graph(n, 100, 42);
 
         group.bench_with_input(BenchmarkId::new("HJS", n), &(&g, src), |b, &(g, src)| {
