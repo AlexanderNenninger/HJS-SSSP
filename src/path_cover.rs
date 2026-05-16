@@ -9,10 +9,10 @@
 //!
 //! The algorithm is divide-and-conquer on the active node set A ⊆ V(G).
 //!
-//! **Base case** — |A| = 1: return the trivial identity subgraph [G[A]].
+//! **Base case** — |A| = 1: return the trivial identity subgraph G\[A\].
 //!
 //! **Recursive step**: pick an arbitrary node u ∈ A.  Run forward and
-//! backward Dijkstra (in G[A]) to grow "balls" of increasing radius i·d,
+//! backward Dijkstra (in G\[A\]) to grow "balls" of increasing radius i·d,
 //! stopping at the first "thin layer" where the ball does not grow by more
 //! than a factor (1 + ε′).
 //!
@@ -93,7 +93,7 @@ fn path_cover_rec(
     let u_raw = active_nodes[0];
     let u = NodeId(u_raw);
 
-    // ── Forward Dijkstra: dist_out[v] = d_{G[A]}(u, v) ───────────────────────
+    // ── Forward Dijkstra: dist_out[v] = d_{G\[A\]}(u, v) ───────────────────────
     let dist_out = dijkstra_subgraph(g, u, active, false);
 
     // Find i_out: smallest i ≥ 1 with a "thin" forward layer.
@@ -149,7 +149,7 @@ fn path_cover_rec(
     // `ancestors_in_tree` logic applies (walk parent pointers from m to root u).
     let t_tilde_in = ancestors_in_tree(&parent_in, &m, u_raw, n);
 
-    // H_mid = G[V(T̃_out) ∪ V(T̃_in)]: identity projection on that induced subgraph.
+    // H_mid = G\[V(T̃_out) ∪ V(T̃_in)\]: identity projection on that induced subgraph.
     let h_mid_ids: Vec<NodeId> = (0..n as u32)
         .filter(|&v| t_tilde_out[v as usize] || t_tilde_in[v as usize])
         .map(NodeId)
@@ -167,14 +167,14 @@ fn path_cover_rec(
     Projection::layer(vec![h_tilde_out, h_mid, h_bar_in], g)
 }
 
-// ── Helper: Dijkstra within G[active] ────────────────────────────────────────
+// ── Helper: Dijkstra within G\[active\] ────────────────────────────────────────
 
-/// Run Dijkstra from `source` within the subgraph G[active].
+/// Run Dijkstra from `source` within the subgraph G\[active\].
 ///
 /// If `backward` is true, follows in-edges (computing distances TO `source`
 /// in the original graph, i.e., shortest-path distances in the reverse graph).
 ///
-/// Returns `dist[v]` = shortest distance (INF if unreachable).
+/// Returns `dist\[v\]` = shortest distance (INF if unreachable).
 fn dijkstra_subgraph(g: &Graph, source: NodeId, active: &[bool], backward: bool) -> Vec<i64> {
     let n = g.node_count();
     let mut dist = vec![INF; n];
@@ -221,7 +221,7 @@ fn dijkstra_subgraph(g: &Graph, source: NodeId, active: &[bool], backward: bool)
 
 /// Same as [`dijkstra_subgraph`] but also returns parent pointers.
 ///
-/// `parent[v]` = node u such that the SPT edge is u→v (forward) or v→u (backward).
+/// `parent\[v\]` = node u such that the SPT edge is u→v (forward) or v→u (backward).
 /// In both cases walking from v via parent pointers reaches the root `source`.
 fn dijkstra_with_parents(
     g: &Graph,
@@ -338,7 +338,7 @@ fn find_thin_layer(
 /// marked (to avoid repeated root traversals).
 ///
 /// Works for both forward SPTs (T_out) and backward SPTs (T_in) because in
-/// both cases `parent[v]` points one step closer to the root u.
+/// both cases `parent\[v\]` points one step closer to the root u.
 fn ancestors_in_tree(parent: &[Option<u32>], m: &[bool], root: u32, n: usize) -> Vec<bool> {
     let mut included = vec![false; n];
     for v in 0..n as u32 {

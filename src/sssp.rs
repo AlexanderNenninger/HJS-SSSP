@@ -12,23 +12,23 @@
 //!
 //! - **Base case** (k ≤ log⁶ n): handled by [`sssp_few_negative`] (Lemma 5.5),
 //!   which alternates Dijkstra and Bellman-Ford passes.
-//! - **Recursive case**: build a d-path cover of H≥0 via [`path_cover`],
+//! - **Recursive case**: build a d-path cover of H≥0 via \[`path_cover`\],
 //!   restore weights, prune to within-SCC edges (Lemma 5.4 premise),
 //!   solve recursively with k/2 negative edges allowed, then assemble G″
 //!   (x = 2λ tiered copies) and solve SSSP on the potential-adjusted G″ via
-//!   [`sssp_cross_scc`] (Lemma 5.4).
+//!   \[`sssp_cross_scc`\] (Lemma 5.4).
 //!
 //! # Subroutines
 //!
 //! | Function | Paper reference |
 //! |---|---|
-//! | [`dijkstra`] | standard |
-//! | [`sssp_cross_scc`] | Lemma 5.4 — SSSP when negatives cross SCCs |
-//! | [`sssp_few_negative`] | Lemma 5.5 — alternating Dijkstra / BF |
-//! | [`path_cover`] | Theorem 4.5 (wraps `crate::projection`) |
-//! | [`scc`] | Tarjan's algorithm |
-//! | [`k_sssp`] | §5.1 recursive algorithm |
-//! | [`sssp`] | Theorem 1.1 outer driver |
+//! | \[`dijkstra`\] | standard |
+//! | \[`sssp_cross_scc`\] | Lemma 5.4 — SSSP when negatives cross SCCs |
+//! | \[`sssp_few_negative`\] | Lemma 5.5 — alternating Dijkstra / BF |
+//! | \[`path_cover`\] | Theorem 4.5 (wraps `crate::projection`) |
+//! | \[`scc`\] | Tarjan's algorithm |
+//! | \[`k_sssp`\] | §5.1 recursive algorithm |
+//! | \[`sssp`\] | Theorem 1.1 outer driver |
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -421,7 +421,7 @@ fn build_path_cover(g: &Graph, d_cov: i64, lambda: usize) -> Projection {
 ///
 /// `threshold` is the base-case cutoff (≈ log⁶ n in the paper; exposed here
 /// for testing).
-fn k_sssp(h: &Graph, source: NodeId, k: usize, threshold: usize) -> Vec<i64> {
+pub fn k_sssp(h: &Graph, source: NodeId, k: usize, threshold: usize) -> Vec<i64> {
     let n = h.node_count();
 
     // Fast path: no negative edges → plain Dijkstra.
@@ -724,7 +724,7 @@ fn k_sssp(h: &Graph, source: NodeId, k: usize, threshold: usize) -> Vec<i64> {
 /// needs new *potentials*, not full distances).
 ///
 /// Returns `None` if a negative cycle is detected.
-fn sssp_minus_one(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
+pub fn sssp_minus_one(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
     let n = g.node_count();
     let neg_edges: Vec<EdgeId> = g.edges().filter(|&e| g.weight(e) < 0).collect();
 
