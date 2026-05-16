@@ -29,11 +29,11 @@ fn build_graph<'py>(
     digraph: &Bound<'py, PyAny>,
     weight_attr: &str,
     default_weight: i64,
-) -> PyResult<(Graph, Py<PyDict>, Vec<PyObject>)> {
+) -> PyResult<(Graph, Py<PyDict>, Vec<Py<PyAny>>)> {
     // Assign each unique node a dense integer index via a Python dict
     // so that Python's own hash/equality logic handles arbitrary node types.
     let node_to_idx = PyDict::new(py);
-    let mut idx_to_node: Vec<PyObject> = Vec::new();
+    let mut idx_to_node: Vec<Py<PyAny>> = Vec::new();
 
     for item in digraph.call_method0("nodes")?.try_iter()? {
         let node = item?;
@@ -67,7 +67,7 @@ fn build_graph<'py>(
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("edge target not in node list"))?
             .extract()?;
 
-        let w: i64 = if let Ok(d) = attr.downcast::<PyDict>() {
+        let w: i64 = if let Ok(d) = attr.extract::<Bound<'_, PyDict>>() {
             if let Some(val) = d.get_item(weight_attr)? {
                 val.extract::<i64>()?
             } else {
@@ -95,7 +95,7 @@ fn resolve_source(node_to_idx: &Bound<'_, PyDict>, source: &Bound<'_, PyAny>) ->
 fn dist_to_dict<'py>(
     py: Python<'py>,
     dist: &[i64],
-    idx_to_node: &[PyObject],
+    idx_to_node: &[Py<PyAny>],
 ) -> PyResult<Bound<'py, PyDict>> {
     let out = PyDict::new(py);
     for (i, &d) in dist.iter().enumerate() {
@@ -138,11 +138,11 @@ fn sssp(
     source: &Bound<'_, PyAny>,
     weight: &str,
     default_weight: i64,
-) -> PyResult<Option<PyObject>> {
+) -> PyResult<Option<Py<PyAny>>> {
     let (g, node_to_idx_owned, idx_to_node) = build_graph(py, digraph, weight, default_weight)?;
     let src = resolve_source(node_to_idx_owned.bind(py), source)?;
     algo::sssp(&g, NodeId(src))
-        .map(|d| dist_to_dict(py, &d, &idx_to_node).map(|d| d.into()))
+        .map(|d| dist_to_dict(py, &d, &idx_to_node).map(|d| d.into_any().unbind()))
         .transpose()
 }
 
@@ -158,11 +158,11 @@ fn goldberg(
     source: &Bound<'_, PyAny>,
     weight: &str,
     default_weight: i64,
-) -> PyResult<Option<PyObject>> {
+) -> PyResult<Option<Py<PyAny>>> {
     let (g, node_to_idx_owned, idx_to_node) = build_graph(py, digraph, weight, default_weight)?;
     let src = resolve_source(node_to_idx_owned.bind(py), source)?;
     algo::goldberg(&g, NodeId(src))
-        .map(|d| dist_to_dict(py, &d, &idx_to_node).map(|d| d.into()))
+        .map(|d| dist_to_dict(py, &d, &idx_to_node).map(|d| d.into_any().unbind()))
         .transpose()
 }
 
@@ -178,11 +178,11 @@ fn bellman_ford(
     source: &Bound<'_, PyAny>,
     weight: &str,
     default_weight: i64,
-) -> PyResult<Option<PyObject>> {
+) -> PyResult<Option<Py<PyAny>>> {
     let (g, node_to_idx_owned, idx_to_node) = build_graph(py, digraph, weight, default_weight)?;
     let src = resolve_source(node_to_idx_owned.bind(py), source)?;
     algo::bellman_ford(&g, NodeId(src))
-        .map(|d| dist_to_dict(py, &d, &idx_to_node).map(|d| d.into()))
+        .map(|d| dist_to_dict(py, &d, &idx_to_node).map(|d| d.into_any().unbind()))
         .transpose()
 }
 

@@ -35,12 +35,12 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      # pyo3 0.23 requires Python ≤3.13; install it so the build script finds it.
+      # pyo3 0.28 supports Python 3.14; install it so the build script finds it.
       # On Windows pprof is excluded so --all-features = only pyo3 + rayon.
-      - name: Install Python 3.13
+      - name: Install Python 3.14
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.14"
 
       - name: cargo test
         run: cargo test --all-features
