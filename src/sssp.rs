@@ -401,6 +401,11 @@ fn build_path_cover(g: &Graph, d_cov: i64, lambda: usize) -> Projection {
 fn k_sssp(h: &Graph, source: NodeId, k: usize, threshold: usize) -> Vec<i64> {
     let n = h.node_count();
 
+    // Fast path: no negative edges → plain Dijkstra.
+    if !h.edges().any(|e| h.weight(e) < 0) {
+        return dijkstra(h, source);
+    }
+
     // ── Base case ─────────────────────────────────────────────────────────────
     if k <= threshold {
         return sssp_few_negative(h, source, k).unwrap_or_else(|| vec![INF; n]);
@@ -877,32 +882,53 @@ pub fn sssp(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
             }
         }
 
+        // Build the scaled graph for this phase.
+        // Reduced weight = (w(e) >> shift) + φ(u) − φ(v).
+        // Clamped to [-1, n]: values < -1 arise in early phases while the
+        // potential is still rough; a true negative cycle is detected later
+        // by the final residual check.
+        let mut g_scaled = Graph::with_capacity(n + 1, g.edge_count() + n);
+        g_scaled.add_nodes(n + 1);
+        let super_src = NodeId(n as u32);
+
+        let mut has_neg = false;
         for e in g.edges() {
             let u = g.source(e);
             let v = g.target(e);
-            let w_scaled = g.weight(e) >> shift as u32; // arithmetic right shift
+            let w_scaled = g.weight(e) >> shift as u32;
             let phi_u = phi[u.0 as usize];
             let phi_v = phi[v.0 as usize];
-            let w_adj = if phi_u < INF && phi_v < INF {
-                w_scaled.saturating_add(phi_u).saturating_sub(phi_v)
-            } else {
-                INF
-            };
-            // Clamp to valid range; values < -1 indicate a negative cycle.
-            if w_adj < -1 {
-                return None; // negative cycle
+            if phi_u >= INF || phi_v >= INF {
+                continue;
             }
-            let w_clamped = w_adj.min(n as i64);
-            g_scaled.add_edge(u, v, w_clamped);
+            let w = w_scaled
+                .saturating_add(phi_u)
+                .saturating_sub(phi_v)
+                .max(-1)
+                .min(n as i64);
+            if w < 0 {
+                has_neg = true;
+            }
+            g_scaled.add_edge(u, v, w);
         }
 
-        // Add super-source with 0-weight edges to all nodes (Definition 5.1).
+        // Super-source reaches every node with cost 0.
         for v in 0..n as u32 {
             g_scaled.add_edge(super_src, NodeId(v), 0);
         }
 
-        // Solve restricted SSSP from super-source.
-        let dist_phase = restricted_sssp(&g_scaled, super_src);
+        // If no negative edges exist after adjustment, Dijkstra suffices.
+        let dist_phase = if !has_neg {
+            dijkstra(&g_scaled, super_src)
+        } else {
+            // Weights lie in {-1, 0, …, n}: use the O(m√n) subroutine
+            // directly, bypassing the restricted_sssp → k_sssp chain whose
+            // recursive case never fires at these sizes.
+            match sssp_minus_one(&g_scaled, super_src) {
+                Some(d) => d,
+                None => return None,
+            }
+        };
 
         // Update potential: φ_new(v) = dist(super_src, v).
         for v in 0..n {
