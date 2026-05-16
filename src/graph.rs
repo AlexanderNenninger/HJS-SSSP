@@ -161,6 +161,20 @@ impl Graph {
     pub fn edges(&self) -> impl Iterator<Item = EdgeId> {
         (0..self.edges.len() as u32).map(EdgeId)
     }
+
+    /// First outgoing edge from `node`, or `None` if there are none.
+    ///
+    /// Combined with [`next_out_edge`](Self::next_out_edge) this allows
+    /// iterating out-edges without a heap-allocated adjacency list.
+    pub fn first_out_edge(&self, node: NodeId) -> Option<EdgeId> {
+        self.nodes[node.0 as usize].first_out
+    }
+
+    /// The outgoing edge that follows `e` from the same source node, or `None`
+    /// if `e` is the last outgoing edge of that node.
+    pub fn next_out_edge(&self, e: EdgeId) -> Option<EdgeId> {
+        self.edges[e.0 as usize].next_out
+    }
 }
 
 impl Default for Graph {

@@ -95,18 +95,15 @@ pub fn scc(g: &Graph) -> (Vec<usize>, usize) {
     let mut num_sccs = 0usize;
 
     // Iterative Tarjan: explicit call stack to avoid recursion depth limits.
-    // Each frame: (node, iterator over out-edges).
-    // We need to iterate out-edges lazily, so we collect them first per node.
-    let adj: Vec<Vec<u32>> = (0..n as u32)
-        .map(|v| g.out_edges(NodeId(v)).map(|e| g.target(e).0).collect())
-        .collect();
-
+    // Each frame stores the node and an `Option<EdgeId>` cursor into its
+    // outgoing edge list — no pre-collected adjacency Vec needed.
     for start in 0..n as u32 {
         if index[start as usize] != usize::MAX {
             continue;
         }
-        // (node, edge_index_into_adj)
-        let mut call_stack: Vec<(u32, usize)> = vec![(start, 0)];
+        // (node, cursor: next out-edge to process, or None when exhausted)
+        let mut call_stack: Vec<(u32, Option<EdgeId>)> =
+            vec![(start, g.first_out_edge(NodeId(start)))];
 
         while let Some(frame) = call_stack.last_mut() {
             let u = frame.0;
@@ -119,32 +116,35 @@ pub fn scc(g: &Graph) -> (Vec<usize>, usize) {
                 on_stack[u as usize] = true;
             }
 
-            let ei = frame.1;
-            if ei < adj[u as usize].len() {
-                frame.1 += 1;
-                let w = adj[u as usize][ei];
-                if index[w as usize] == usize::MAX {
-                    call_stack.push((w, 0));
-                } else if on_stack[w as usize] {
-                    lowlink[u as usize] = lowlink[u as usize].min(index[w as usize]);
-                }
-            } else {
-                // All neighbours processed — pop frame and propagate lowlink.
-                call_stack.pop();
-                if let Some(parent_frame) = call_stack.last() {
-                    let p = parent_frame.0;
-                    lowlink[p as usize] = lowlink[p as usize].min(lowlink[u as usize]);
-                }
-                // Check if u is an SCC root.
-                if lowlink[u as usize] == index[u as usize] {
-                    while let Some(w) = stack.pop() {
-                        on_stack[w as usize] = false;
-                        comp[w as usize] = num_sccs;
-                        if w == u {
-                            break;
-                        }
+            match frame.1 {
+                Some(e) => {
+                    // Advance cursor before potentially pushing a new frame.
+                    frame.1 = g.next_out_edge(e);
+                    let w = g.target(e).0;
+                    if index[w as usize] == usize::MAX {
+                        call_stack.push((w, g.first_out_edge(NodeId(w))));
+                    } else if on_stack[w as usize] {
+                        lowlink[u as usize] = lowlink[u as usize].min(index[w as usize]);
                     }
-                    num_sccs += 1;
+                }
+                None => {
+                    // All neighbours processed — pop frame and propagate lowlink.
+                    call_stack.pop();
+                    if let Some(parent_frame) = call_stack.last() {
+                        let p = parent_frame.0;
+                        lowlink[p as usize] = lowlink[p as usize].min(lowlink[u as usize]);
+                    }
+                    // Check if u is an SCC root.
+                    if lowlink[u as usize] == index[u as usize] {
+                        while let Some(w) = stack.pop() {
+                            on_stack[w as usize] = false;
+                            comp[w as usize] = num_sccs;
+                            if w == u {
+                                break;
+                            }
+                        }
+                        num_sccs += 1;
+                    }
                 }
             }
         }
@@ -186,12 +186,6 @@ pub fn sssp_cross_scc(g: &Graph, source: NodeId) -> Vec<i64> {
         // All within-SCC edges are non-negative by hypothesis.
         let nodes = &scc_nodes[scc_id];
 
-        // Collect finite-distance seeds within this SCC.
-        let mut seeds: Vec<i64> = Vec::new();
-        for &v in nodes {
-            seeds.push(dist[v as usize]);
-        }
-
         // Mini Dijkstra within the SCC.
         let mut heap: BinaryHeap<Reverse<(i64, u32)>> = BinaryHeap::new();
         for &v in nodes {
@@ -200,20 +194,17 @@ pub fn sssp_cross_scc(g: &Graph, source: NodeId) -> Vec<i64> {
             }
         }
 
-        // Build a fast "is in this SCC?" lookup.
-        let in_scc: std::collections::HashSet<u32> = nodes.iter().cloned().collect();
-
+        // Membership test: `comp[v] == scc_id` — free compared to a HashSet.
         while let Some(Reverse((d, u))) = heap.pop() {
             if d > dist[u as usize] {
                 continue;
             }
             for e in g.out_edges(NodeId(u)) {
                 let v = g.target(e);
-                let w = g.weight(e);
-                if !in_scc.contains(&v.0) {
+                if comp[v.0 as usize] != scc_id {
                     continue; // cross-SCC edge; handled below
                 }
-                let nd = d.saturating_add(w);
+                let nd = d.saturating_add(g.weight(e));
                 if nd < dist[v.0 as usize] {
                     dist[v.0 as usize] = nd;
                     heap.push(Reverse((nd, v.0)));
@@ -229,7 +220,7 @@ pub fn sssp_cross_scc(g: &Graph, source: NodeId) -> Vec<i64> {
             }
             for e in g.out_edges(NodeId(u)) {
                 let v = g.target(e);
-                if in_scc.contains(&v.0) {
+                if comp[v.0 as usize] == scc_id {
                     continue;
                 }
                 // Negative cross-SCC edges are allowed.
@@ -263,18 +254,23 @@ pub fn sssp_few_negative(g: &Graph, source: NodeId, k: usize) -> Option<Vec<i64>
     let mut dist = vec![INF; n];
     dist[source.0 as usize] = 0;
 
-    // We alternate: Dijkstra (non-negative edges only) then one BF pass
-    // (negative edges only), repeated k times.
+    // Track which nodes to seed each Dijkstra pass.
+    // Start with the source; after each BF pass seed only the nodes whose
+    // distance was updated — re-processing all finite-distance nodes every
+    // round is wasteful when few nodes change per BF round.
+    let mut in_seed = vec![false; n];
+    let mut seed_nodes: Vec<u32> = vec![source.0];
+    in_seed[source.0 as usize] = true;
 
     for _ in 0..=k {
-        // Dijkstra step: relax all non-negative edges from current distances.
-        // We do a full Dijkstra seeded with all currently-finite distances.
+        // Dijkstra step: non-negative edges only, seeded from `seed_nodes`.
         let mut heap: BinaryHeap<Reverse<(i64, u32)>> = BinaryHeap::new();
-        for v in 0..n as u32 {
-            if dist[v as usize] < INF {
-                heap.push(Reverse((dist[v as usize], v)));
-            }
+        for &v in &seed_nodes {
+            in_seed[v as usize] = false; // reset in-place for the next round
+            heap.push(Reverse((dist[v as usize], v)));
         }
+        seed_nodes.clear();
+
         while let Some(Reverse((d, u))) = heap.pop() {
             if d > dist[u as usize] {
                 continue;
@@ -293,7 +289,7 @@ pub fn sssp_few_negative(g: &Graph, source: NodeId, k: usize) -> Option<Vec<i64>
         }
 
         // Bellman-Ford pass: relax all negative edges once.
-        let mut updated = false;
+        // Collect the nodes whose distance improved — they seed the next Dijkstra.
         for &e in &neg_edges {
             let u = g.source(e);
             let v = g.target(e);
@@ -304,11 +300,14 @@ pub fn sssp_few_negative(g: &Graph, source: NodeId, k: usize) -> Option<Vec<i64>
             let nd = du.saturating_add(g.weight(e));
             if nd < dist[v.0 as usize] {
                 dist[v.0 as usize] = nd;
-                updated = true;
+                if !in_seed[v.0 as usize] {
+                    in_seed[v.0 as usize] = true;
+                    seed_nodes.push(v.0);
+                }
             }
         }
 
-        if !updated {
+        if seed_nodes.is_empty() {
             break;
         }
     }
@@ -355,8 +354,19 @@ fn build_path_cover(g: &Graph, d_cov: i64, lambda: usize) -> Projection {
     let cover_nonneg = crate::path_cover::path_cover(&h_nonneg, d_cov, lambda);
 
     // Restore original (possibly negative) edge weights.
-    // For each edge (u′, v′) in the cover, the corresponding original edge is
-    // (π(u′), π(v′)) ∈ E(G).  We find it by scanning outgoing edges of π(u′).
+    // Pre-build a (src, tgt) → weight map so each cover edge is looked up in
+    // O(1) instead of scanning g's adjacency list per edge — reduces total
+    // work from O(m_cover · avg_deg) to O(m_g + m_cover).
+    // For parallel edges we keep the first weight found, matching the
+    // previous `break`-on-first-match behaviour.
+    let mut weight_map: std::collections::HashMap<(u32, u32), i64> =
+        std::collections::HashMap::with_capacity(g.edge_count());
+    for e in g.edges() {
+        weight_map
+            .entry((g.source(e).0, g.target(e).0))
+            .or_insert_with(|| g.weight(e));
+    }
+
     let cover_nodes = cover_nonneg.graph.node_count();
     let cover_edges = cover_nonneg.graph.edge_count();
     let mut cover_graph = Graph::with_capacity(cover_nodes, cover_edges);
@@ -367,14 +377,10 @@ fn build_path_cover(g: &Graph, d_cov: i64, lambda: usize) -> Projection {
         let tgt = cover_nonneg.graph.target(e);
         let orig_src = cover_nonneg.original_of(src);
         let orig_tgt = cover_nonneg.original_of(tgt);
-        // Find the matching edge weight in g.
-        let mut w = 0i64;
-        for ge in g.out_edges(orig_src) {
-            if g.target(ge) == orig_tgt {
-                w = g.weight(ge);
-                break;
-            }
-        }
+        let w = weight_map
+            .get(&(orig_src.0, orig_tgt.0))
+            .copied()
+            .unwrap_or(0);
         cover_graph.add_edge(src, tgt, w);
     }
 
