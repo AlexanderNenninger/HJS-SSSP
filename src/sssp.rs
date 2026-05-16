@@ -42,6 +42,10 @@
 struct RadixHeap {
     last: u64,
     len: usize,
+    /// Bitmask: bit (b-1) is set iff `buckets[b]` is non-empty, for b ∈ 1..=64.
+    /// Lets `pop` find the next non-empty bucket in O(1) via `trailing_zeros`
+    /// instead of scanning 64 Vec headers.
+    nonempty: u64,
     buckets: [Vec<(u64, u32)>; 65],
 }
 
@@ -50,6 +54,7 @@ impl RadixHeap {
         Self {
             last: 0,
             len: 0,
+            nonempty: 0,
             buckets: std::array::from_fn(|_| Vec::new()),
         }
     }
@@ -59,6 +64,9 @@ impl RadixHeap {
         let k = rh_to_u64(key);
         let b = rh_bucket(self.last, k);
         self.buckets[b].push((k, val));
+        if b > 0 {
+            self.nonempty |= 1u64 << (b - 1);
+        }
         self.len += 1;
     }
 
@@ -74,36 +82,50 @@ impl RadixHeap {
             "RadixHeap::reset called with items still present"
         );
         self.last = 0;
+        self.nonempty = 0;
         for b in &mut self.buckets {
             b.clear();
         }
     }
 
-    #[inline]
+    /// Fast-path pop: inlined so the common case (bucket 0 non-empty) is just
+    /// a bounds check + Vec::pop with no function-call overhead.
+    #[inline(always)]
     fn pop(&mut self) -> Option<(i64, u32)> {
         if self.len == 0 {
             return None;
         }
         if self.buckets[0].is_empty() {
-            // Find the first non-empty bucket (skip index 0).
-            let b = self.buckets[1..]
-                .iter()
-                .position(|bkt| !bkt.is_empty())
-                .map(|i| i + 1)
-                .unwrap();
-            // New `last` = minimum key in that bucket.
-            let new_last = self.buckets[b].iter().map(|&(k, _)| k).min().unwrap();
-            self.last = new_last;
-            // Redistribute the bucket's contents into their correct new buckets.
-            let items: Vec<(u64, u32)> = std::mem::take(&mut self.buckets[b]);
-            for (k, v) in items {
-                let new_b = rh_bucket(self.last, k);
-                self.buckets[new_b].push((k, v));
-            }
+            self.pop_slow();
         }
         self.len -= 1;
         let (k, v) = self.buckets[0].pop().unwrap();
         Some((rh_to_i64(k), v))
+    }
+
+    /// Cold redistribution path — called only when bucket 0 is empty.
+    /// Finds the next non-empty bucket in O(1) via the `nonempty` bitmask,
+    /// then scatters its items into their correct lower-numbered buckets.
+    #[cold]
+    #[inline(never)]
+    fn pop_slow(&mut self) {
+        debug_assert_ne!(self.nonempty, 0);
+        // trailing_zeros → index into bits 0..63 → bucket 1..64
+        let b = self.nonempty.trailing_zeros() as usize + 1;
+        // Clear the bit before redistribution; push() below will set new bits.
+        self.nonempty &= !(1u64 << (b - 1));
+        // New `last` = minimum key in that bucket.
+        let new_last = self.buckets[b].iter().map(|&(k, _)| k).min().unwrap();
+        self.last = new_last;
+        // Redistribute into correct new buckets.
+        let items: Vec<(u64, u32)> = std::mem::take(&mut self.buckets[b]);
+        for (k, v) in items {
+            let new_b = rh_bucket(self.last, k);
+            self.buckets[new_b].push((k, v));
+            if new_b > 0 {
+                self.nonempty |= 1u64 << (new_b - 1);
+            }
+        }
     }
 }
 
@@ -843,14 +865,18 @@ pub fn k_sssp(h: &Graph, source: NodeId, k: usize, threshold: usize) -> Vec<i64>
 /// Returns `None` if a negative cycle is detected.
 pub fn sssp_minus_one(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
     let n = g.node_count();
-    // Pre-split edges: non-negative CSR adjacency + flat (src, tgt, weight) tuples.
-    // Eliminates linked-list pointer-chasing and the g.weight(e)<0 branch per edge.
+    // Pre-split edges: non-negative CSR adjacency + flat (src, tgt) pairs for
+    // negative edges. The contract for this function is that all negative edge
+    // weights equal exactly -1, so we drop the weight field to halve the size of
+    // neg_raw (8 B/entry vs 16 B/entry), doubling cache-line utilisation in the
+    // BF scan.
     let mut nonneg_count = vec![0u32; n];
-    let mut neg_raw: Vec<(u32, u32, i64)> = Vec::new();
+    let mut neg_raw: Vec<(u32, u32)> = Vec::new();
     for e in g.edges() {
         let w = g.weight(e);
         if w < 0 {
-            neg_raw.push((g.source(e).0, g.target(e).0, w));
+            debug_assert_eq!(w, -1, "sssp_minus_one: neg edge weight must be -1");
+            neg_raw.push((g.source(e).0, g.target(e).0));
         } else {
             nonneg_count[g.source(e).0 as usize] += 1;
         }
@@ -920,12 +946,12 @@ pub fn sssp_minus_one(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
             let dist_snap: &[i64] = &dist;
             let bf_updates: Vec<(u32, i64)> = neg_raw
                 .par_iter()
-                .filter_map(|&(u, v, w)| {
+                .filter_map(|&(u, v)| {
                     let du = dist_snap[u as usize];
                     if du >= INF {
                         return None;
                     }
-                    let nd = du.saturating_add(w);
+                    let nd = du.saturating_sub(1);
                     if nd < dist_snap[v as usize] {
                         Some((v, nd))
                     } else {
@@ -950,13 +976,13 @@ pub fn sssp_minus_one(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
         let _par_bf_done = false;
 
         if !_par_bf_done {
-            // Serial direct-mutation path.
-            for &(u, v, w) in &neg_raw {
+            // Serial direct-mutation path.  Weight is always -1 by contract.
+            for &(u, v) in &neg_raw {
                 let du = dist[u as usize];
                 if du >= INF {
                     continue;
                 }
-                let nd = du.saturating_add(w);
+                let nd = du.saturating_sub(1);
                 if nd < dist[v as usize] {
                     dist[v as usize] = nd;
                     if !in_seed[v as usize] {
@@ -972,10 +998,10 @@ pub fn sssp_minus_one(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
         }
     }
 
-    // Negative-cycle check: one more BF pass.
-    for &(u, v, w) in &neg_raw {
+    // Negative-cycle check: one more BF pass.  Weight is always -1 by contract.
+    for &(u, v) in &neg_raw {
         let du = dist[u as usize];
-        if du < INF && du.saturating_add(w) < dist[v as usize] {
+        if du < INF && du.saturating_sub(1) < dist[v as usize] {
             return None;
         }
     }
