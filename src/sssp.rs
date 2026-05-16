@@ -33,6 +33,9 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use crate::graph::{EdgeId, Graph, NodeId};
 use crate::projection::Projection;
 
@@ -40,6 +43,26 @@ use crate::projection::Projection;
 
 /// A distance value of +∞ — no path exists.
 pub const INF: i64 = i64::MAX / 2;
+
+/// Minimum edge count at which Bellman-Ford relaxation rounds are parallelised.
+///
+/// Below this threshold the per-round Rayon fork/join overhead (≈10 µs) exceeds
+/// the savings from parallel edge scanning, so we fall back to direct in-place
+/// mutation (no allocation per round).  Derived from benchmarks: at n=800 sparse
+/// (m≈3 200) the round synchronisation cost dominates; 4 096 sits just above
+/// that, ensuring the parallel path fires only for genuinely large edge sets.
+#[cfg(feature = "parallel")]
+const PAR_BF_MIN_EDGES: usize = 4_096;
+
+/// Minimum work count at which graph-construction loops are parallelised.
+///
+/// On macOS, waking Rayon's thread pool costs ~50–100 µs per `into_par_iter()`
+/// call.  At 65 536 items — assuming simple arithmetic per edge — the parallel
+/// throughput (≈8× for 8 threads) covers that fixed overhead.  At benchmark
+/// sizes (n ≤ 800, m ≤ 3 200) all graph-construction loops remain serial;
+/// the threshold matters for large graphs (n ≥ 10 000).
+#[cfg(feature = "parallel")]
+const PAR_GRAPH_MIN_EDGES: usize = 65_536;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Dijkstra (non-negative weights only)
@@ -473,50 +496,146 @@ fn k_sssp(h: &Graph, source: NodeId, k: usize, threshold: usize) -> Vec<i64> {
     // Helper: G′-node v′ in copy i → G″ global id.
     let global = |i: usize, v_prime: u32| -> NodeId { NodeId((i * n_prime) as u32 + v_prime) };
 
-    // Internal edges within each copy (G′ edges, potential-adjusted).
-    for i in 0..x {
-        for e in g_prime.edges() {
-            let u = g_prime.source(e);
-            let v = g_prime.target(e);
-            let w = g_prime.weight(e);
-            let phi_u = phi[u.0 as usize];
-            let phi_v = phi[v.0 as usize];
-            let w_adj = if phi_u < INF && phi_v < INF {
-                w.saturating_add(phi_u).saturating_sub(phi_v)
-            } else {
-                INF
-            };
-            if w_adj < INF {
-                g_double.add_edge(global(i, u.0), global(i, v.0), w_adj);
-            }
-        }
-    }
-
-    // Cross-layer edges (copy i → copy i+1):
-    // For each H-edge (u_orig, v_orig) and each G′-preimage u′ of u_orig,
-    // add edge from copy_i(u′) to copy_{i+1}(rep(v_orig)).
-    for i in 0..(x - 1) {
-        for eh in h.edges() {
-            let u_orig = h.source(eh);
+    // Pre-compute H-edge data (resolve representative once, skip missing).
+    let h_data: Vec<(u32, u32, i64)> = (0..h.edge_count() as u32)
+        .filter_map(|j| {
+            let eh = EdgeId(j);
+            let u_orig = h.source(eh).0;
             let v_orig = h.target(eh);
             let w_h = h.weight(eh);
-            let v_rep = match cover.representative(v_orig) {
-                Some(r) => r.0,
-                None => continue,
-            };
-            let phi_v = phi[v_rep as usize];
-            for &u_prime in &preimage_idx[u_orig.0 as usize] {
-                let phi_u = phi[u_prime as usize];
+            let v_rep = cover.representative(v_orig)?.0;
+            Some((u_orig, v_rep, w_h))
+        })
+        .collect();
+
+    // Collect internal G′ edges (potential-adjusted) for all x copies.
+    let phi_slice: &[i64] = &phi;
+
+    #[cfg(feature = "parallel")]
+    let internal_edges: Vec<(u32, u32, i64)> = {
+        let f = |i: usize| {
+            let base = (i * n_prime) as u32;
+            (0..g_prime.edge_count() as u32).filter_map(move |j| {
+                let e = EdgeId(j);
+                let u = g_prime.source(e);
+                let v = g_prime.target(e);
+                let w = g_prime.weight(e);
+                let phi_u = phi_slice[u.0 as usize];
+                let phi_v = phi_slice[v.0 as usize];
                 let w_adj = if phi_u < INF && phi_v < INF {
-                    w_h.saturating_add(phi_u).saturating_sub(phi_v)
+                    w.saturating_add(phi_u).saturating_sub(phi_v)
                 } else {
                     INF
                 };
                 if w_adj < INF {
-                    g_double.add_edge(global(i, u_prime), global(i + 1, v_rep), w_adj);
+                    Some((base + u.0, base + v.0, w_adj))
+                } else {
+                    None
                 }
-            }
+            })
+        };
+        if x * g_prime.edge_count() >= PAR_GRAPH_MIN_EDGES {
+            (0..x).into_par_iter().flat_map_iter(f).collect()
+        } else {
+            (0..x).flat_map(f).collect()
         }
+    };
+
+    #[cfg(not(feature = "parallel"))]
+    let internal_edges: Vec<(u32, u32, i64)> = (0..x)
+        .flat_map(|i| {
+            let base = (i * n_prime) as u32;
+            (0..g_prime.edge_count() as u32).filter_map(move |j| {
+                let e = EdgeId(j);
+                let u = g_prime.source(e);
+                let v = g_prime.target(e);
+                let w = g_prime.weight(e);
+                let phi_u = phi_slice[u.0 as usize];
+                let phi_v = phi_slice[v.0 as usize];
+                let w_adj = if phi_u < INF && phi_v < INF {
+                    w.saturating_add(phi_u).saturating_sub(phi_v)
+                } else {
+                    INF
+                };
+                if w_adj < INF {
+                    Some((base + u.0, base + v.0, w_adj))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    // Collect cross-layer edges (copy i → copy i+1, via H-edges).
+    let preimage_snap: &[Vec<u32>] = &preimage_idx;
+
+    #[cfg(feature = "parallel")]
+    let cross_edges: Vec<(u32, u32, i64)> = {
+        let f = |i: usize| {
+            let base_src = (i * n_prime) as u32;
+            let base_dst = ((i + 1) * n_prime) as u32;
+            h_data.iter().flat_map(move |&(u_orig, v_rep, w_h)| {
+                let phi_v = phi_slice[v_rep as usize];
+                preimage_snap[u_orig as usize]
+                    .iter()
+                    .filter_map(move |&u_prime| {
+                        let phi_u = phi_slice[u_prime as usize];
+                        let w_adj = if phi_u < INF && phi_v < INF {
+                            w_h.saturating_add(phi_u).saturating_sub(phi_v)
+                        } else {
+                            INF
+                        };
+                        if w_adj < INF {
+                            Some((base_src + u_prime, base_dst + v_rep, w_adj))
+                        } else {
+                            None
+                        }
+                    })
+            })
+        };
+        let x_sub1 = x.saturating_sub(1);
+        if x_sub1 * h_data.len() >= PAR_GRAPH_MIN_EDGES {
+            (0..x_sub1).into_par_iter().flat_map_iter(f).collect()
+        } else {
+            (0..x_sub1).flat_map(f).collect()
+        }
+    };
+
+    #[cfg(not(feature = "parallel"))]
+    let cross_edges: Vec<(u32, u32, i64)> = (0..x.saturating_sub(1))
+        .flat_map(|i| {
+            let base_src = (i * n_prime) as u32;
+            let base_dst = ((i + 1) * n_prime) as u32;
+            h_data.iter().flat_map(move |&(u_orig, v_rep, w_h)| {
+                let phi_v = phi_slice[v_rep as usize];
+                preimage_snap[u_orig as usize]
+                    .iter()
+                    .filter_map(move |&u_prime| {
+                        let phi_u = phi_slice[u_prime as usize];
+                        let w_adj = if phi_u < INF && phi_v < INF {
+                            w_h.saturating_add(phi_u).saturating_sub(phi_v)
+                        } else {
+                            INF
+                        };
+                        if w_adj < INF {
+                            Some((base_src + u_prime, base_dst + v_rep, w_adj))
+                        } else {
+                            None
+                        }
+                    })
+            })
+        })
+        .collect();
+
+    let mut g_double =
+        Graph::with_capacity(total_nodes, internal_edges.len() + cross_edges.len() + x);
+    g_double.add_nodes(total_nodes);
+
+    for (u, v, w) in internal_edges {
+        g_double.add_edge(NodeId(u), NodeId(v), w);
+    }
+    for (u, v, w) in cross_edges {
+        g_double.add_edge(NodeId(u), NodeId(v), w);
     }
 
     // s″ → every preimage of `source` in every copy of G′.
@@ -532,24 +651,60 @@ fn k_sssp(h: &Graph, source: NodeId, k: usize, threshold: usize) -> Vec<i64> {
     // ── Recover distances for H ───────────────────────────────────────────────
     // d_s(u) = min over all preimages u′ of u, over all copies i,
     //          of { d_{s″}(global(i, u′)) + φ(u′) }.
-    let mut dist = vec![INF; n];
-    for u in 0..n as u32 {
-        for &u_prime in &preimage_idx[u as usize] {
-            let phi_u = phi[u_prime as usize];
-            if phi_u >= INF {
-                continue;
-            }
-            for i in 0..x {
-                let d_raw = dist_double[global(i, u_prime).0 as usize];
-                if d_raw < INF {
-                    let d_u = d_raw.saturating_add(phi_u);
-                    if d_u < dist[u as usize] {
-                        dist[u as usize] = d_u;
+    // ── Recover distances for H ───────────────────────────────────────────────
+    // d_s(u) = min over all preimages u′ of u, over all copies i,
+    //          of { d_{s″}(global(i, u′)) + φ(u′) }.
+    // Each u is independent — safe to parallelise with a map.
+    #[cfg(feature = "parallel")]
+    let dist: Vec<i64> = {
+        let f = |u: u32| {
+            let mut best = INF;
+            for &u_prime in &preimage_snap[u as usize] {
+                let phi_u = phi_slice[u_prime as usize];
+                if phi_u >= INF {
+                    continue;
+                }
+                for i in 0..x {
+                    let d_raw = dist_double[(i * n_prime) as usize + u_prime as usize];
+                    if d_raw < INF {
+                        let d_u = d_raw.saturating_add(phi_u);
+                        if d_u < best {
+                            best = d_u;
+                        }
                     }
                 }
             }
+            best
+        };
+        if n >= PAR_GRAPH_MIN_EDGES {
+            (0..n as u32).into_par_iter().map(f).collect()
+        } else {
+            (0..n as u32).map(f).collect()
         }
-    }
+    };
+
+    #[cfg(not(feature = "parallel"))]
+    let dist: Vec<i64> = (0..n as u32)
+        .map(|u| {
+            let mut best = INF;
+            for &u_prime in &preimage_snap[u as usize] {
+                let phi_u = phi_slice[u_prime as usize];
+                if phi_u >= INF {
+                    continue;
+                }
+                for i in 0..x {
+                    let d_raw = dist_double[(i * n_prime) as usize + u_prime as usize];
+                    if d_raw < INF {
+                        let d_u = d_raw.saturating_add(phi_u);
+                        if d_u < best {
+                            best = d_u;
+                        }
+                    }
+                }
+            }
+            best
+        })
+        .collect();
 
     dist
 }
@@ -611,19 +766,60 @@ fn sssp_minus_one(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
         }
 
         // Single BF pass over the −1 edges.
-        for &e in &neg_edges {
-            let u = g.source(e);
-            let v = g.target(e);
-            let du = dist[u.0 as usize];
-            if du >= INF {
-                continue;
+        // Parallel + large enough: collect-then-apply snapshot (race-free).
+        // Otherwise: direct in-place mutation — no allocation per round.
+        #[cfg(feature = "parallel")]
+        if neg_edges.len() >= PAR_BF_MIN_EDGES {
+            let dist_snap: &[i64] = &dist;
+            let bf_updates: Vec<(u32, i64)> = neg_edges
+                .par_iter()
+                .filter_map(|&e| {
+                    let u = g.source(e);
+                    let v = g.target(e);
+                    let du = dist_snap[u.0 as usize];
+                    if du >= INF {
+                        return None;
+                    }
+                    let nd = du.saturating_add(g.weight(e));
+                    if nd < dist_snap[v.0 as usize] {
+                        Some((v.0, nd))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (v, nd) in bf_updates {
+                if nd < dist[v as usize] {
+                    dist[v as usize] = nd;
+                    if !in_seed[v as usize] {
+                        in_seed[v as usize] = true;
+                        seed_nodes.push(v);
+                    }
+                }
             }
-            let nd = du.saturating_add(g.weight(e));
-            if nd < dist[v.0 as usize] {
-                dist[v.0 as usize] = nd;
-                if !in_seed[v.0 as usize] {
-                    in_seed[v.0 as usize] = true;
-                    seed_nodes.push(v.0);
+            // fall through to seed_nodes check
+        }
+        #[cfg(feature = "parallel")]
+        let _par_bf_done = neg_edges.len() >= PAR_BF_MIN_EDGES;
+        #[cfg(not(feature = "parallel"))]
+        let _par_bf_done = false;
+
+        if !_par_bf_done {
+            // Serial direct-mutation path.
+            for &e in &neg_edges {
+                let u = g.source(e);
+                let v = g.target(e);
+                let du = dist[u.0 as usize];
+                if du >= INF {
+                    continue;
+                }
+                let nd = du.saturating_add(g.weight(e));
+                if nd < dist[v.0 as usize] {
+                    dist[v.0 as usize] = nd;
+                    if !in_seed[v.0 as usize] {
+                        in_seed[v.0 as usize] = true;
+                        seed_nodes.push(v.0);
+                    }
                 }
             }
         }
@@ -690,27 +886,60 @@ pub fn goldberg(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
 
         // Build G_φ: reduced weight = (w(e) >> shift) + φ(u) − φ(v).
         // By induction this is ≥ −1; cap at n (higher values don't affect SP).
-        let mut g_phi = Graph::with_capacity(n + 1, g.edge_count() + n);
+        //
+        // Compute edge data in parallel, then insert serially (Graph is not
+        // Sync because add_edge mutates the arena).
+        let m = g.edge_count() as u32;
+        let phi_snap: &[i64] = &phi;
+        let n_i64 = n as i64;
+
+        #[cfg(feature = "parallel")]
+        let phi_edges: Vec<(u32, u32, i64)> = {
+            let f = |i: u32| -> Option<(u32, u32, i64)> {
+                let e = EdgeId(i);
+                let u = g.source(e);
+                let v = g.target(e);
+                let phi_u = phi_snap[u.0 as usize];
+                let phi_v = phi_snap[v.0 as usize];
+                if phi_u >= INF || phi_v >= INF {
+                    return None;
+                }
+                let w = (g.weight(e) >> shift)
+                    .saturating_add(phi_u)
+                    .saturating_sub(phi_v);
+                Some((u.0, v.0, w.max(-1).min(n_i64)))
+            };
+            if (m as usize) >= PAR_GRAPH_MIN_EDGES {
+                (0..m).into_par_iter().filter_map(f).collect()
+            } else {
+                (0..m).filter_map(f).collect()
+            }
+        };
+
+        #[cfg(not(feature = "parallel"))]
+        let phi_edges: Vec<(u32, u32, i64)> = (0..m)
+            .filter_map(|i| {
+                let e = EdgeId(i);
+                let u = g.source(e);
+                let v = g.target(e);
+                let phi_u = phi_snap[u.0 as usize];
+                let phi_v = phi_snap[v.0 as usize];
+                if phi_u >= INF || phi_v >= INF {
+                    return None;
+                }
+                let w = (g.weight(e) >> shift)
+                    .saturating_add(phi_u)
+                    .saturating_sub(phi_v);
+                Some((u.0, v.0, w.max(-1).min(n_i64)))
+            })
+            .collect();
+
+        let mut g_phi = Graph::with_capacity(n + 1, phi_edges.len() + n);
         g_phi.add_nodes(n + 1);
         let super_src = NodeId(n as u32);
 
-        for e in g.edges() {
-            let u = g.source(e);
-            let v = g.target(e);
-            let phi_u = phi[u.0 as usize];
-            let phi_v = phi[v.0 as usize];
-            if phi_u >= INF || phi_v >= INF {
-                continue;
-            }
-            let w = (g.weight(e) >> shift)
-                .saturating_add(phi_u)
-                .saturating_sub(phi_v);
-            // During early phases reduced weights may temporarily be < -1 if
-            // the current potential is still a rough approximation.  We clamp
-            // to -1 (the minimum valid weight for sssp_minus_one) and let
-            // subsequent phases refine the potential.  A true negative cycle
-            // will be caught by the final Dijkstra residual check.
-            g_phi.add_edge(u, v, w.max(-1).min(n as i64));
+        for (u, v, w) in phi_edges {
+            g_phi.add_edge(NodeId(u), NodeId(v), w);
         }
         // Super-source reaches every node with cost 0.
         for v in 0..n as u32 {
@@ -732,21 +961,53 @@ pub fn goldberg(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
     }
 
     // All reduced weights are now ≥ 0: run a final Dijkstra.
-    let mut g_final = Graph::with_capacity(n, g.edge_count());
-    g_final.add_nodes(n);
-    for e in g.edges() {
-        let u = g.source(e);
-        let v = g.target(e);
-        let phi_u = phi[u.0 as usize];
-        let phi_v = phi[v.0 as usize];
-        if phi_u >= INF || phi_v >= INF {
-            continue;
+    let m = g.edge_count() as u32;
+    let phi_snap: &[i64] = &phi;
+
+    #[cfg(feature = "parallel")]
+    let final_edges: Vec<(u32, u32, i64)> = {
+        let f = |i: u32| -> Option<(u32, u32, i64)> {
+            let e = EdgeId(i);
+            let u = g.source(e);
+            let v = g.target(e);
+            let phi_u = phi_snap[u.0 as usize];
+            let phi_v = phi_snap[v.0 as usize];
+            if phi_u >= INF || phi_v >= INF {
+                return None;
+            }
+            let w_adj = g.weight(e).saturating_add(phi_u).saturating_sub(phi_v);
+            Some((u.0, v.0, w_adj))
+        };
+        if (m as usize) >= PAR_GRAPH_MIN_EDGES {
+            (0..m).into_par_iter().filter_map(f).collect()
+        } else {
+            (0..m).filter_map(f).collect()
         }
-        let w_adj = g.weight(e).saturating_add(phi_u).saturating_sub(phi_v);
+    };
+
+    #[cfg(not(feature = "parallel"))]
+    let final_edges: Vec<(u32, u32, i64)> = (0..m)
+        .filter_map(|i| {
+            let e = EdgeId(i);
+            let u = g.source(e);
+            let v = g.target(e);
+            let phi_u = phi_snap[u.0 as usize];
+            let phi_v = phi_snap[v.0 as usize];
+            if phi_u >= INF || phi_v >= INF {
+                return None;
+            }
+            let w_adj = g.weight(e).saturating_add(phi_u).saturating_sub(phi_v);
+            Some((u.0, v.0, w_adj))
+        })
+        .collect();
+
+    let mut g_final = Graph::with_capacity(n, final_edges.len());
+    g_final.add_nodes(n);
+    for (u, v, w_adj) in final_edges {
         if w_adj < 0 {
             return None; // residual negative weight — negative cycle
         }
-        g_final.add_edge(u, v, w_adj);
+        g_final.add_edge(NodeId(u), NodeId(v), w_adj);
     }
 
     let dist_adj = dijkstra(&g_final, source);
@@ -781,14 +1042,45 @@ pub fn bellman_ford(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
     let mut dist = vec![INF; n];
     dist[source.0 as usize] = 0;
 
-    // Collect edges once.
+    // Collect edges once as plain tuples so they are Send + Sync.
     let edges: Vec<(u32, u32, i64)> = g
         .edges()
         .map(|e| (g.source(e).0, g.target(e).0, g.weight(e)))
         .collect();
 
     // n−1 relaxation rounds.
+    // When the parallel feature is active and the edge count crosses
+    // PAR_BF_MIN_EDGES, each round is parallelised via a collect-then-apply
+    // snapshot (no data race).  Otherwise we use direct in-place mutation with
+    // an early-exit flag — zero allocation per round.
     for _ in 0..(n.saturating_sub(1)) {
+        #[cfg(feature = "parallel")]
+        if edges.len() >= PAR_BF_MIN_EDGES {
+            let updates: Vec<(usize, i64)> = edges
+                .par_iter()
+                .filter_map(|&(u, v, w)| {
+                    let du = dist[u as usize];
+                    if du < INF {
+                        let nd = du.saturating_add(w);
+                        if nd < dist[v as usize] {
+                            return Some((v as usize, nd));
+                        }
+                    }
+                    None
+                })
+                .collect();
+            if updates.is_empty() {
+                break;
+            }
+            for (v, nd) in updates {
+                if nd < dist[v] {
+                    dist[v] = nd;
+                }
+            }
+            continue; // skip the serial block below
+        }
+
+        // Serial direct-mutation path: no Vec allocation per round.
         let mut updated = false;
         for &(u, v, w) in &edges {
             let du = dist[u as usize];
@@ -805,7 +1097,7 @@ pub fn bellman_ford(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
         }
     }
 
-    // One more pass to detect negative cycles.
+    // One more pass to detect negative cycles (always serial — tiny cost).
     for &(u, v, w) in &edges {
         let du = dist[u as usize];
         if du < INF && du.saturating_add(w) < dist[v as usize] {
@@ -880,29 +1172,65 @@ pub fn sssp(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
         // Clamped to [-1, n]: values < -1 arise in early phases while the
         // potential is still rough; a true negative cycle is detected later
         // by the final residual check.
-        let mut g_scaled = Graph::with_capacity(n + 1, g.edge_count() + n);
+        let m = g.edge_count() as u32;
+        let phi_snap: &[i64] = &phi;
+        let n_i64 = n as i64;
+
+        #[cfg(feature = "parallel")]
+        let scaled_edges: Vec<(u32, u32, i64)> = {
+            let f = |i: u32| -> Option<(u32, u32, i64)> {
+                let e = EdgeId(i);
+                let u = g.source(e);
+                let v = g.target(e);
+                let phi_u = phi_snap[u.0 as usize];
+                let phi_v = phi_snap[v.0 as usize];
+                if phi_u >= INF || phi_v >= INF {
+                    return None;
+                }
+                let w_scaled = g.weight(e) >> shift as u32;
+                let w = w_scaled
+                    .saturating_add(phi_u)
+                    .saturating_sub(phi_v)
+                    .max(-1)
+                    .min(n_i64);
+                Some((u.0, v.0, w))
+            };
+            if (m as usize) >= PAR_GRAPH_MIN_EDGES {
+                (0..m).into_par_iter().filter_map(f).collect()
+            } else {
+                (0..m).filter_map(f).collect()
+            }
+        };
+
+        #[cfg(not(feature = "parallel"))]
+        let scaled_edges: Vec<(u32, u32, i64)> = (0..m)
+            .filter_map(|i| {
+                let e = EdgeId(i);
+                let u = g.source(e);
+                let v = g.target(e);
+                let phi_u = phi_snap[u.0 as usize];
+                let phi_v = phi_snap[v.0 as usize];
+                if phi_u >= INF || phi_v >= INF {
+                    return None;
+                }
+                let w_scaled = g.weight(e) >> shift as u32;
+                let w = w_scaled
+                    .saturating_add(phi_u)
+                    .saturating_sub(phi_v)
+                    .max(-1)
+                    .min(n_i64);
+                Some((u.0, v.0, w))
+            })
+            .collect();
+
+        let has_neg = scaled_edges.iter().any(|&(_, _, w)| w < 0);
+
+        let mut g_scaled = Graph::with_capacity(n + 1, scaled_edges.len() + n);
         g_scaled.add_nodes(n + 1);
         let super_src = NodeId(n as u32);
 
-        let mut has_neg = false;
-        for e in g.edges() {
-            let u = g.source(e);
-            let v = g.target(e);
-            let w_scaled = g.weight(e) >> shift as u32;
-            let phi_u = phi[u.0 as usize];
-            let phi_v = phi[v.0 as usize];
-            if phi_u >= INF || phi_v >= INF {
-                continue;
-            }
-            let w = w_scaled
-                .saturating_add(phi_u)
-                .saturating_sub(phi_v)
-                .max(-1)
-                .min(n as i64);
-            if w < 0 {
-                has_neg = true;
-            }
-            g_scaled.add_edge(u, v, w);
+        for (u, v, w) in scaled_edges {
+            g_scaled.add_edge(NodeId(u), NodeId(v), w);
         }
 
         // Super-source reaches every node with cost 0.
@@ -936,21 +1264,53 @@ pub fn sssp(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
 
     // Final pass: apply potential to get true distances from `source`.
     // Build the final potential-adjusted graph (all weights ≥ 0) and run Dijkstra.
-    let mut g_final = Graph::with_capacity(n, g.edge_count());
-    g_final.add_nodes(n);
-    for e in g.edges() {
-        let u = g.source(e);
-        let v = g.target(e);
-        let phi_u = phi[u.0 as usize];
-        let phi_v = phi[v.0 as usize];
-        if phi_u >= INF || phi_v >= INF {
-            continue;
+    let m = g.edge_count() as u32;
+    let phi_snap: &[i64] = &phi;
+
+    #[cfg(feature = "parallel")]
+    let final_edges: Vec<(u32, u32, i64)> = {
+        let f = |i: u32| -> Option<(u32, u32, i64)> {
+            let e = EdgeId(i);
+            let u = g.source(e);
+            let v = g.target(e);
+            let phi_u = phi_snap[u.0 as usize];
+            let phi_v = phi_snap[v.0 as usize];
+            if phi_u >= INF || phi_v >= INF {
+                return None;
+            }
+            let w_adj = g.weight(e).saturating_add(phi_u).saturating_sub(phi_v);
+            Some((u.0, v.0, w_adj))
+        };
+        if (m as usize) >= PAR_GRAPH_MIN_EDGES {
+            (0..m).into_par_iter().filter_map(f).collect()
+        } else {
+            (0..m).filter_map(f).collect()
         }
-        let w_adj = g.weight(e).saturating_add(phi_u).saturating_sub(phi_v);
+    };
+
+    #[cfg(not(feature = "parallel"))]
+    let final_edges: Vec<(u32, u32, i64)> = (0..m)
+        .filter_map(|i| {
+            let e = EdgeId(i);
+            let u = g.source(e);
+            let v = g.target(e);
+            let phi_u = phi_snap[u.0 as usize];
+            let phi_v = phi_snap[v.0 as usize];
+            if phi_u >= INF || phi_v >= INF {
+                return None;
+            }
+            let w_adj = g.weight(e).saturating_add(phi_u).saturating_sub(phi_v);
+            Some((u.0, v.0, w_adj))
+        })
+        .collect();
+
+    let mut g_final = Graph::with_capacity(n, final_edges.len());
+    g_final.add_nodes(n);
+    for (u, v, w_adj) in final_edges {
         if w_adj < 0 {
             return None; // residual negative weight — negative cycle
         }
-        g_final.add_edge(u, v, w_adj);
+        g_final.add_edge(NodeId(u), NodeId(v), w_adj);
     }
 
     let dist_adj = dijkstra(&g_final, source);
@@ -1008,28 +1368,63 @@ pub fn sssp_hjs_forced(g: &Graph, source: NodeId, forced_threshold: usize) -> Op
             }
         }
 
-        let mut g_scaled = Graph::with_capacity(n + 1, g.edge_count() + n);
+        let m = g.edge_count() as u32;
+        let phi_snap: &[i64] = &phi;
+        let n_i64 = n as i64;
+
+        #[cfg(feature = "parallel")]
+        let scaled_edges: Vec<(u32, u32, i64)> = {
+            let f = |i: u32| -> Option<(u32, u32, i64)> {
+                let e = EdgeId(i);
+                let u = g.source(e);
+                let v = g.target(e);
+                let phi_u = phi_snap[u.0 as usize];
+                let phi_v = phi_snap[v.0 as usize];
+                if phi_u >= INF || phi_v >= INF {
+                    return None;
+                }
+                let w = (g.weight(e) >> shift as u32)
+                    .saturating_add(phi_u)
+                    .saturating_sub(phi_v)
+                    .max(-1)
+                    .min(n_i64);
+                Some((u.0, v.0, w))
+            };
+            if (m as usize) >= PAR_GRAPH_MIN_EDGES {
+                (0..m).into_par_iter().filter_map(f).collect()
+            } else {
+                (0..m).filter_map(f).collect()
+            }
+        };
+
+        #[cfg(not(feature = "parallel"))]
+        let scaled_edges: Vec<(u32, u32, i64)> = (0..m)
+            .filter_map(|i| {
+                let e = EdgeId(i);
+                let u = g.source(e);
+                let v = g.target(e);
+                let phi_u = phi_snap[u.0 as usize];
+                let phi_v = phi_snap[v.0 as usize];
+                if phi_u >= INF || phi_v >= INF {
+                    return None;
+                }
+                let w = (g.weight(e) >> shift as u32)
+                    .saturating_add(phi_u)
+                    .saturating_sub(phi_v)
+                    .max(-1)
+                    .min(n_i64);
+                Some((u.0, v.0, w))
+            })
+            .collect();
+
+        let has_neg = scaled_edges.iter().any(|&(_, _, w)| w < 0);
+
+        let mut g_scaled = Graph::with_capacity(n + 1, scaled_edges.len() + n);
         g_scaled.add_nodes(n + 1);
         let super_src = NodeId(n as u32);
 
-        let mut has_neg = false;
-        for e in g.edges() {
-            let u = g.source(e);
-            let v = g.target(e);
-            let phi_u = phi[u.0 as usize];
-            let phi_v = phi[v.0 as usize];
-            if phi_u >= INF || phi_v >= INF {
-                continue;
-            }
-            let w = (g.weight(e) >> shift as u32)
-                .saturating_add(phi_u)
-                .saturating_sub(phi_v)
-                .max(-1)
-                .min(n as i64);
-            if w < 0 {
-                has_neg = true;
-            }
-            g_scaled.add_edge(u, v, w);
+        for (u, v, w) in scaled_edges {
+            g_scaled.add_edge(NodeId(u), NodeId(v), w);
         }
         for v in 0..n as u32 {
             g_scaled.add_edge(super_src, NodeId(v), 0);
@@ -1053,21 +1448,53 @@ pub fn sssp_hjs_forced(g: &Graph, source: NodeId, forced_threshold: usize) -> Op
         }
     }
 
-    let mut g_final = Graph::with_capacity(n, g.edge_count());
-    g_final.add_nodes(n);
-    for e in g.edges() {
-        let u = g.source(e);
-        let v = g.target(e);
-        let phi_u = phi[u.0 as usize];
-        let phi_v = phi[v.0 as usize];
-        if phi_u >= INF || phi_v >= INF {
-            continue;
+    let m = g.edge_count() as u32;
+    let phi_snap: &[i64] = &phi;
+
+    #[cfg(feature = "parallel")]
+    let final_edges_forced: Vec<(u32, u32, i64)> = {
+        let f = |i: u32| -> Option<(u32, u32, i64)> {
+            let e = EdgeId(i);
+            let u = g.source(e);
+            let v = g.target(e);
+            let phi_u = phi_snap[u.0 as usize];
+            let phi_v = phi_snap[v.0 as usize];
+            if phi_u >= INF || phi_v >= INF {
+                return None;
+            }
+            let w_adj = g.weight(e).saturating_add(phi_u).saturating_sub(phi_v);
+            Some((u.0, v.0, w_adj))
+        };
+        if (m as usize) >= PAR_GRAPH_MIN_EDGES {
+            (0..m).into_par_iter().filter_map(f).collect()
+        } else {
+            (0..m).filter_map(f).collect()
         }
-        let w_adj = g.weight(e).saturating_add(phi_u).saturating_sub(phi_v);
+    };
+
+    #[cfg(not(feature = "parallel"))]
+    let final_edges_forced: Vec<(u32, u32, i64)> = (0..m)
+        .filter_map(|i| {
+            let e = EdgeId(i);
+            let u = g.source(e);
+            let v = g.target(e);
+            let phi_u = phi_snap[u.0 as usize];
+            let phi_v = phi_snap[v.0 as usize];
+            if phi_u >= INF || phi_v >= INF {
+                return None;
+            }
+            let w_adj = g.weight(e).saturating_add(phi_u).saturating_sub(phi_v);
+            Some((u.0, v.0, w_adj))
+        })
+        .collect();
+
+    let mut g_final = Graph::with_capacity(n, final_edges_forced.len());
+    g_final.add_nodes(n);
+    for (u, v, w_adj) in final_edges_forced {
         if w_adj < 0 {
             return None;
         }
-        g_final.add_edge(u, v, w_adj);
+        g_final.add_edge(NodeId(u), NodeId(v), w_adj);
     }
 
     let dist_adj = dijkstra(&g_final, source);
