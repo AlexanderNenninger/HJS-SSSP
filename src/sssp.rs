@@ -22,13 +22,13 @@
 //!
 //! | Function | Paper reference |
 //! |---|---|
-//! | \[`dijkstra`\] | standard |
-//! | \[`sssp_cross_scc`\] | Lemma 5.4 — SSSP when negatives cross SCCs |
-//! | \[`sssp_few_negative`\] | Lemma 5.5 — alternating Dijkstra / BF |
-//! | \[`path_cover`\] | Theorem 4.5 (wraps `crate::projection`) |
-//! | \[`scc`\] | Tarjan's algorithm |
-//! | \[`k_sssp`\] | §5.1 recursive algorithm |
-//! | \[`sssp`\] | Theorem 1.1 outer driver |
+//! | [`dijkstra`] | standard |
+//! | [`sssp_cross_scc`] | Lemma 5.4 — SSSP when negatives cross SCCs |
+//! | [`sssp_few_negative`] | Lemma 5.5 — alternating Dijkstra / BF |
+//! | [`path_cover`] | Theorem 4.5 (wraps `crate::projection`) |
+//! | [`scc`] | Tarjan's algorithm |
+//! | [`k_sssp`] | §5.1 recursive algorithm |
+//! | [`sssp`] | Theorem 1.1 outer driver |
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Radix heap (monotone priority queue for integer-keyed Dijkstra)
