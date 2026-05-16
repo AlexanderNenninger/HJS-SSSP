@@ -868,13 +868,6 @@ pub fn sssp(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
         // double φ and add the current phase's bit of each weight.
         let shift = phases - 1 - phase;
 
-        // Build the scaled graph for this phase.
-        // Scaled weight = (w(e) >> shift) + φ(u) - φ(v).
-        // After potential adjustment this must lie in {-1, 0, …, n}.
-        let mut g_scaled = Graph::with_capacity(n + 1, g.edge_count() + n);
-        g_scaled.add_nodes(n + 1);
-        let super_src = NodeId(n as u32);
-
         // Double all current potentials.
         for v in 0..n {
             if phi[v] < INF {
@@ -977,6 +970,122 @@ pub fn sssp(g: &Graph, source: NodeId) -> Option<Vec<i64>> {
         .collect();
 
     Some(result)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HJS with forced path-cover recursion
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// HJS SSSP with a **forced** path-cover recursion threshold.
+///
+/// Identical to [`sssp`] in structure, but each per-phase inner SSSP is solved
+/// by [`k_sssp`] with `threshold = forced_threshold` rather than by the
+/// `sssp_minus_one` (Goldberg) shortcut.  Setting `forced_threshold` to a
+/// small value (e.g. 2) makes the `k_sssp` recursive case fire at all
+/// practical sizes, so the path-cover / G″ construction actually runs.
+///
+/// This exists for benchmarking the true HJS algorithm against Goldberg.
+pub fn sssp_hjs_forced(g: &Graph, source: NodeId, forced_threshold: usize) -> Option<Vec<i64>> {
+    let n = g.node_count();
+    if n == 0 {
+        return Some(Vec::new());
+    }
+
+    let w_max: i64 = g.edges().map(|e| g.weight(e).abs()).max().unwrap_or(0);
+    if w_max == 0 {
+        return Some(dijkstra(g, source));
+    }
+
+    let phases = (i64::BITS - w_max.leading_zeros()) as usize + 1;
+    let mut phi = vec![0i64; n];
+
+    for phase in 0..phases {
+        let shift = phases - 1 - phase;
+
+        for v in 0..n {
+            if phi[v] < INF {
+                phi[v] = phi[v].saturating_mul(2);
+            }
+        }
+
+        let mut g_scaled = Graph::with_capacity(n + 1, g.edge_count() + n);
+        g_scaled.add_nodes(n + 1);
+        let super_src = NodeId(n as u32);
+
+        let mut has_neg = false;
+        for e in g.edges() {
+            let u = g.source(e);
+            let v = g.target(e);
+            let phi_u = phi[u.0 as usize];
+            let phi_v = phi[v.0 as usize];
+            if phi_u >= INF || phi_v >= INF {
+                continue;
+            }
+            let w = (g.weight(e) >> shift as u32)
+                .saturating_add(phi_u)
+                .saturating_sub(phi_v)
+                .max(-1)
+                .min(n as i64);
+            if w < 0 {
+                has_neg = true;
+            }
+            g_scaled.add_edge(u, v, w);
+        }
+        for v in 0..n as u32 {
+            g_scaled.add_edge(super_src, NodeId(v), 0);
+        }
+
+        let dist_phase = if !has_neg {
+            dijkstra(&g_scaled, super_src)
+        } else {
+            // Use k_sssp with the forced threshold so the path-cover
+            // recursion fires rather than falling back to sssp_minus_one.
+            k_sssp(&g_scaled, super_src, n + 1, forced_threshold)
+        };
+
+        for v in 0..n {
+            let d = dist_phase[v];
+            phi[v] = if phi[v] < INF && d < INF {
+                phi[v].saturating_add(d)
+            } else {
+                INF
+            };
+        }
+    }
+
+    let mut g_final = Graph::with_capacity(n, g.edge_count());
+    g_final.add_nodes(n);
+    for e in g.edges() {
+        let u = g.source(e);
+        let v = g.target(e);
+        let phi_u = phi[u.0 as usize];
+        let phi_v = phi[v.0 as usize];
+        if phi_u >= INF || phi_v >= INF {
+            continue;
+        }
+        let w_adj = g.weight(e).saturating_add(phi_u).saturating_sub(phi_v);
+        if w_adj < 0 {
+            return None;
+        }
+        g_final.add_edge(u, v, w_adj);
+    }
+
+    let dist_adj = dijkstra(&g_final, source);
+    let phi_s = phi[source.0 as usize];
+
+    Some(
+        (0..n)
+            .map(|v| {
+                let d = dist_adj[v];
+                let phi_v = phi[v];
+                if d < INF && phi_v < INF && phi_s < INF {
+                    d.saturating_add(phi_v).saturating_sub(phi_s)
+                } else {
+                    INF
+                }
+            })
+            .collect(),
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
