@@ -1,242 +1,96 @@
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, SamplingMode, black_box, criterion_group, criterion_main};
-use hjs_sssp::graph::{Graph, NodeId};
+use hjs_sssp::generators::{make_grid_graph, make_path_graph, make_random_graph};
 use hjs_sssp::sssp::{bellman_ford, goldberg, sssp, sssp_hjs_forced};
 
-// ── Graph generators ──────────────────────────────────────────────────────────
+// Bellman-Ford is O(V·E).  At 4n edges that is O(4n²), so it is only included
+// for graphs small enough that it finishes in a reasonable time.
+const BF_NODE_LIMIT: usize = 2_000;
+// sssp_hjs_forced fires the full path-cover recursion at every level; useful
+// for small graphs but redundant overhead at larger sizes.
+const HJS_FORCED_LIMIT: usize = 2_000;
 
-/// Dense random-ish graph on `n` nodes and ~4n directed edges.
-/// Weights in [-w_max, w_max], seeded deterministically.
-/// This is the "light" version used in main benchmarks.
-fn make_sparse_graph(n: usize, w_max: i64, seed: u64) -> (Graph, NodeId) {
-    let mut g = Graph::with_capacity(n, 4 * n);
-    g.add_nodes(n);
-    let mut rng = seed;
-    let next = |r: &mut u64| -> u64 {
-        // xorshift64
-        *r ^= *r << 13;
-        *r ^= *r >> 7;
-        *r ^= *r << 17;
-        *r
-    };
-    // Each node gets ~4 random out-edges.
-    for u in 0..n as u32 {
-        for _ in 0..4 {
-            let v = (next(&mut rng) as usize % n) as u32;
-            let w = (next(&mut rng) % (2 * w_max as u64 + 1)) as i64 - w_max;
-            if u != v {
-                g.add_edge(NodeId(u), NodeId(v), w);
-            }
-        }
-    }
-    (g, NodeId(0))
-}
-/// Dense random graph on n nodes with ~10n directed edges and large weight range.
-/// Designed to stress HJS's recursive decomposition advantages over Goldberg.
-/// Heavier density (10n vs 4n) and larger weight range force more scaling phases.
-fn make_dense_complex_graph(n: usize, w_max: i64, seed: u64) -> (Graph, NodeId) {
-    let mut g = Graph::with_capacity(n, 10 * n);
-    g.add_nodes(n);
-    let mut rng = seed;
-    let next = |r: &mut u64| -> u64 {
-        *r ^= *r << 13;
-        *r ^= *r >> 7;
-        *r ^= *r << 17;
-        *r
-    };
-    // Each node gets ~10 random out-edges (heavier than sparse benchmark).
-    for u in 0..n as u32 {
-        for _ in 0..10 {
-            let v = (next(&mut rng) as usize % n) as u32;
-            let w = (next(&mut rng) % (2 * w_max as u64 + 1)) as i64 - w_max;
-            if u != v {
-                g.add_edge(NodeId(u), NodeId(v), w);
-            }
-        }
-    }
-    (g, NodeId(0))
-}
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-///
-/// Path graph 0→1→2→…→(n-1) with weights in \[-w_max, w_max\].
-/// Guaranteed no negative cycle (strictly increasing path).
-fn make_path_graph(n: usize, w_max: i64, seed: u64) -> (Graph, NodeId) {
-    let mut g = Graph::with_capacity(n, n - 1);
-    g.add_nodes(n);
-    let mut rng = seed;
-    let next = |r: &mut u64| -> u64 {
-        *r ^= *r << 13;
-        *r ^= *r >> 7;
-        *r ^= *r << 17;
-        *r
-    };
-    for u in 0..(n - 1) as u32 {
-        let w = (next(&mut rng) % (2 * w_max as u64 + 1)) as i64 - w_max;
-        g.add_edge(NodeId(u), NodeId(u + 1), w);
-    }
-    (g, NodeId(0))
-}
-
-/// Grid graph: nodes (row, col) in an r×c grid, edges right and down with
-/// small random weights.
-fn make_grid_graph(rows: usize, cols: usize, w_max: i64, seed: u64) -> (Graph, NodeId) {
-    let n = rows * cols;
-    let mut g = Graph::with_capacity(n, 2 * n);
-    g.add_nodes(n);
-    let idx = |r: usize, c: usize| NodeId((r * cols + c) as u32);
-    let mut rng = seed;
-    let next = |r: &mut u64| -> u64 {
-        *r ^= *r << 13;
-        *r ^= *r >> 7;
-        *r ^= *r << 17;
-        *r
-    };
-    for r in 0..rows {
-        for c in 0..cols {
-            let w = |rng: &mut u64| (next(rng) % (2 * w_max as u64 + 1)) as i64 - w_max;
-            if c + 1 < cols {
-                g.add_edge(idx(r, c), idx(r, c + 1), w(&mut rng));
-            }
-            if r + 1 < rows {
-                g.add_edge(idx(r, c), idx(r + 1, c), w(&mut rng));
-            }
+macro_rules! bench_all {
+    ($group:expr, $label:expr, $g:expr, $src:expr, $forced:expr, $bf:expr) => {{
+        let (g, src) = ($g, $src);
+        $group.bench_with_input(
+            BenchmarkId::new("HJS", $label),
+            &(&g, src),
+            |b, &(g, src)| b.iter(|| sssp(black_box(g), black_box(src))),
+        );
+        if $forced {
+            $group.bench_with_input(
+                BenchmarkId::new("HJS-forced", $label),
+                &(&g, src),
+                |b, &(g, src)| b.iter(|| sssp_hjs_forced(black_box(g), black_box(src), 2)),
+            );
         }
-    }
-    (g, NodeId(0))
+        $group.bench_with_input(
+            BenchmarkId::new("Goldberg", $label),
+            &(&g, src),
+            |b, &(g, src)| b.iter(|| goldberg(black_box(g), black_box(src))),
+        );
+        if $bf {
+            $group.bench_with_input(
+                BenchmarkId::new("BellmanFord", $label),
+                &(&g, src),
+                |b, &(g, src)| b.iter(|| bellman_ford(black_box(g), black_box(src))),
+            );
+        }
+    }};
 }
 
 // ── Benchmark groups ──────────────────────────────────────────────────────────
 
-fn bench_sparse(c: &mut Criterion) {
-    let mut group = c.benchmark_group("sparse_graph");
-    // HJS is slow (ms range) — use Flat sampling so criterion takes a fixed
-    // number of independent samples instead of trying to pack many iterations
-    // into each measurement window.
-    group.sampling_mode(SamplingMode::Flat);
-    group.sample_size(20);
-    group.warm_up_time(Duration::from_millis(500));
-    group.measurement_time(Duration::from_secs(3));
-
-    for &n in &[50usize, 100, 200, 400, 800] {
-        let (g, src) = make_sparse_graph(n, 10, 42);
-
-        group.bench_with_input(BenchmarkId::new("HJS", n), &(&g, src), |b, &(g, src)| {
-            b.iter(|| sssp(black_box(g), black_box(src)))
-        });
-        group.bench_with_input(
-            BenchmarkId::new("HJS-forced", n),
-            &(&g, src),
-            |b, &(g, src)| b.iter(|| sssp_hjs_forced(black_box(g), black_box(src), 2)),
-        );
-        group.bench_with_input(
-            BenchmarkId::new("Goldberg", n),
-            &(&g, src),
-            |b, &(g, src)| b.iter(|| goldberg(black_box(g), black_box(src))),
-        );
-        group.bench_with_input(
-            BenchmarkId::new("BellmanFord", n),
-            &(&g, src),
-            |b, &(g, src)| b.iter(|| bellman_ford(black_box(g), black_box(src))),
-        );
-    }
-    group.finish();
-}
-
-fn bench_path(c: &mut Criterion) {
-    let mut group = c.benchmark_group("path_graph");
-    group.sampling_mode(SamplingMode::Flat);
-    group.sample_size(20);
-    group.warm_up_time(Duration::from_millis(500));
-    group.measurement_time(Duration::from_secs(3));
-
-    for &n in &[200usize, 500, 1000] {
-        let (g, src) = make_path_graph(n, 5, 99);
-
-        group.bench_with_input(BenchmarkId::new("HJS", n), &(&g, src), |b, &(g, src)| {
-            b.iter(|| sssp(black_box(g), black_box(src)))
-        });
-        group.bench_with_input(
-            BenchmarkId::new("HJS-forced", n),
-            &(&g, src),
-            |b, &(g, src)| b.iter(|| sssp_hjs_forced(black_box(g), black_box(src), 2)),
-        );
-        group.bench_with_input(
-            BenchmarkId::new("Goldberg", n),
-            &(&g, src),
-            |b, &(g, src)| b.iter(|| goldberg(black_box(g), black_box(src))),
-        );
-        group.bench_with_input(
-            BenchmarkId::new("BellmanFord", n),
-            &(&g, src),
-            |b, &(g, src)| b.iter(|| bellman_ford(black_box(g), black_box(src))),
-        );
-    }
-    group.finish();
-}
-
-fn bench_grid(c: &mut Criterion) {
-    let mut group = c.benchmark_group("grid_graph");
-    group.sampling_mode(SamplingMode::Flat);
-    group.sample_size(20);
-    group.warm_up_time(Duration::from_millis(500));
-    group.measurement_time(Duration::from_secs(3));
-
-    for &(r, c_) in &[(10usize, 10usize), (15, 15), (20, 20)] {
-        let label = r * c_;
-        let (g, src) = make_grid_graph(r, c_, 3, 7);
-
-        group.bench_with_input(
-            BenchmarkId::new("HJS", label),
-            &(&g, src),
-            |b, &(g, src)| b.iter(|| sssp(black_box(g), black_box(src))),
-        );
-        group.bench_with_input(
-            BenchmarkId::new("HJS-forced", label),
-            &(&g, src),
-            |b, &(g, src)| b.iter(|| sssp_hjs_forced(black_box(g), black_box(src), 2)),
-        );
-        group.bench_with_input(
-            BenchmarkId::new("Goldberg", label),
-            &(&g, src),
-            |b, &(g, src)| b.iter(|| goldberg(black_box(g), black_box(src))),
-        );
-        group.bench_with_input(
-            BenchmarkId::new("BellmanFord", label),
-            &(&g, src),
-            |b, &(g, src)| b.iter(|| bellman_ford(black_box(g), black_box(src))),
-        );
-    }
-    group.finish();
-}
-
-fn bench_large(c: &mut Criterion) {
-    let mut group = c.benchmark_group("large_dense_graph");
-    // Larger graphs run slower; limit time per benchmark to keep total runtime reasonable.
-    // With sample_size=10 and measurement_time=1s, each benchmark takes ~10s.
+/// Random sparse graphs (sprand): n nodes, 4n arcs, w_max = n.
+fn bench_random(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sprand");
     group.sampling_mode(SamplingMode::Flat);
     group.sample_size(10);
-    group.warm_up_time(Duration::from_millis(300));
-    group.measurement_time(Duration::from_secs(1));
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(5));
 
-    for &n in &[25000usize, 62500] {
-        let (g, src) = make_dense_complex_graph(n, 100, 42);
-
-        // HJS-forced (threshold=2) fires the full path-cover recursion at every
-        // level, exercising the machinery that distinguishes HJS from Goldberg.
-        group.bench_with_input(
-            BenchmarkId::new("HJS-forced", n),
-            &(&g, src),
-            |b, &(g, src)| b.iter(|| sssp_hjs_forced(black_box(g), black_box(src), 2)),
-        );
-        group.bench_with_input(
-            BenchmarkId::new("Goldberg", n),
-            &(&g, src),
-            |b, &(g, src)| b.iter(|| goldberg(black_box(g), black_box(src))),
-        );
+    for &n in &[1_000usize, 10_000, 100_000] {
+        let (g, src) = make_random_graph(n, 4 * n, n as i64, 42);
+        bench_all!(group, n, g, src, n <= HJS_FORCED_LIMIT, n <= BF_NODE_LIMIT);
     }
     group.finish();
 }
 
-criterion_group!(benches, bench_sparse, bench_path, bench_grid, bench_large);
+/// Grid graphs (spgrid): rows×cols nodes, w_max = n.
+/// Sizes: 32×32 ≈ 1 K, 100×100 = 10 K, 316×316 ≈ 100 K nodes.
+fn bench_grid(c: &mut Criterion) {
+    let mut group = c.benchmark_group("spgrid");
+    group.sampling_mode(SamplingMode::Flat);
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(5));
+
+    for &(rows, cols) in &[(32usize, 32usize), (100, 100), (316, 316)] {
+        let n = rows * cols;
+        let (g, src) = make_grid_graph(rows, cols, n as i64, 7);
+        bench_all!(group, n, g, src, n <= HJS_FORCED_LIMIT, n <= BF_NODE_LIMIT);
+    }
+    group.finish();
+}
+
+/// Path graphs (sppath): n nodes, w_max = n.
+fn bench_path(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sppath");
+    group.sampling_mode(SamplingMode::Flat);
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(5));
+
+    for &n in &[1_000usize, 10_000, 100_000] {
+        let (g, src) = make_path_graph(n, n as i64, 99);
+        bench_all!(group, n, g, src, n <= HJS_FORCED_LIMIT, n <= BF_NODE_LIMIT);
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_random, bench_grid, bench_path);
 criterion_main!(benches);
