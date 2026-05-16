@@ -1,0 +1,140 @@
+name: Build wheels
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*"           # v0.1.0, v1.2.3, …
+  pull_request:
+  workflow_dispatch:   # allow manual runs from the GitHub UI
+
+jobs:
+  # ── Build wheels for each platform ─────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Linux x86-64 (manylinux via zig cross-compiler) ────────────────
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: auto
+
+          # ── Linux aarch64 (cross-compiled) ────────────────────────────────
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            manylinux: auto
+
+          # ── macOS x86-64 ──────────────────────────────────────────────────
+          - runner: macos-13       # Intel runner
+            target: x86_64-apple-darwin
+            manylinux: ""
+
+          # ── macOS Apple Silicon ───────────────────────────────────────────
+          - runner: macos-latest   # arm64 runner
+            target: aarch64-apple-darwin
+            manylinux: ""
+
+          # ── Windows x86-64 ────────────────────────────────────────────────
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            manylinux: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --features python --out dist
+          sccache: true
+
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # ── Build a source distribution (sdist) ────────────────────────────────────
+  sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # ── Run Python tests against the built wheel ───────────────────────────────
+  python-test:
+    name: Python tests (${{ matrix.python-version }}, ${{ matrix.os }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.9", "3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          # Pick the wheel matching this runner's OS/arch.
+          pattern: wheels-${{ runner.os == 'Linux' && 'x86_64-unknown-linux-gnu' || runner.os == 'macOS' && 'aarch64-apple-darwin' || 'x86_64-pc-windows-msvc' }}
+          merge-multiple: true
+          path: dist/
+
+      - name: Install wheel and test dependencies
+        run: uv pip install --python ${{ matrix.python-version }} networkx dist/*.whl
+
+      - name: Run Python tests
+        run: uv run --python ${{ matrix.python-version }} python -m unittest discover -s tests -v
+
+  # ── Attach wheels and sdist to the GitHub Release on version tags ───────────
+  release:
+    name: Upload to GitHub Release
+    needs: [build, sdist, python-test]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write   # required to create/update releases
+
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
