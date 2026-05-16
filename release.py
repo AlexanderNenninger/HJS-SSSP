@@ -15,6 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent.resolve()
 CARGO_TOML = ROOT / "Cargo.toml"
+CARGO_LOCK = ROOT / "Cargo.lock"
 PYPROJECT_TOML = ROOT / "pyproject.toml"
 
 
@@ -133,8 +134,12 @@ def main() -> None:
     bump_pyproject(new_version)
     print(f"Updated Cargo.toml and pyproject.toml to {new_version}")
 
+    # Regenerate Cargo.lock so it reflects the new version.
+    run("cargo", "generate-lockfile")
+    print("Regenerated Cargo.lock")
+
     # ── Commit ─────────────────────────────────────────────────────────────
-    git("add", str(CARGO_TOML), str(PYPROJECT_TOML))
+    git("add", str(CARGO_TOML), str(CARGO_LOCK), str(PYPROJECT_TOML))
     git("commit", "-m", f"chore: release {tag}")
     print(f"Committed: chore: release {tag}")
 
@@ -157,7 +162,7 @@ def main() -> None:
         print("Push cancelled — resetting commit and tag.")
         git("tag", "-d", tag)
         git("reset", "--soft", "HEAD~1")
-        reset(changed_files)
+        reset(changed_files + [CARGO_LOCK])
 
 
 if __name__ == "__main__":
